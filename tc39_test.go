@@ -125,44 +125,7 @@ var (
 		"test/language/literals/regexp/S7.8.5_A2.1_T2.js":            true,
 		"test/language/literals/regexp/S7.8.5_A2.4_T2.js":            true,
 
-		// async generator
-		"test/language/expressions/optional-chaining/member-expression.js":                                                                            true,
-		"test/language/expressions/class/elements/same-line-async-method-rs-static-async-generator-method-privatename-identifier-alt.js":              true,
-		"test/language/expressions/class/elements/same-line-async-method-rs-static-async-generator-method-privatename-identifier.js":                  true,
-		"test/language/destructuring/binding/syntax/destructuring-object-parameters-function-arguments-length.js":                                     true,
-		"test/language/destructuring/binding/syntax/destructuring-array-parameters-function-arguments-length.js":                                      true,
-		"test/language/comments/hashbang/function-constructor.js":                                                                                     true,
-		"test/language/statements/class/elements/after-same-line-static-async-method-rs-static-async-generator-method-privatename-identifier.js":      true,
-		"test/language/statements/class/elements/after-same-line-static-async-method-rs-static-async-generator-method-privatename-identifier-alt.js":  true,
-		"test/language/statements/class/elements/same-line-async-method-rs-static-async-generator-method-privatename-identifier.js":                   true,
-		"test/language/statements/class/elements/same-line-async-method-rs-static-async-generator-method-privatename-identifier-alt.js":               true,
-		"test/language/expressions/class/elements/after-same-line-static-async-method-rs-static-async-generator-method-privatename-identifier-alt.js": true,
-		"test/language/expressions/class/elements/after-same-line-static-async-method-rs-static-async-generator-method-privatename-identifier.js":     true,
-		"test/built-ins/Object/seal/seal-asyncgeneratorfunction.js":                                                                                   true,
-		"test/language/statements/switch/scope-lex-async-generator.js":                                                                                true,
-		"test/language/statements/class/elements/private-async-generator-method-name.js":                                                              true,
-		"test/language/expressions/class/elements/private-async-generator-method-name.js":                                                             true,
-		"test/language/expressions/async-generator/name.js":                                                                                           true,
-		"test/language/statements/class/elements/same-line-gen-rs-static-async-generator-method-privatename-identifier.js":                            true,
-		"test/language/statements/class/elements/same-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                        true,
-		"test/language/statements/class/elements/new-sc-line-gen-rs-static-async-generator-method-privatename-identifier.js":                          true,
-		"test/language/statements/class/elements/new-sc-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                      true,
-		"test/language/statements/class/elements/after-same-line-static-gen-rs-static-async-generator-method-privatename-identifier.js":               true,
-		"test/language/statements/class/elements/after-same-line-static-gen-rs-static-async-generator-method-privatename-identifier-alt.js":           true,
-		"test/language/statements/class/elements/after-same-line-gen-rs-static-async-generator-method-privatename-identifier.js":                      true,
-		"test/language/statements/class/elements/after-same-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                  true,
-		"test/language/expressions/class/elements/same-line-gen-rs-static-async-generator-method-privatename-identifier.js":                           true,
-		"test/language/expressions/class/elements/same-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                       true,
-		"test/language/expressions/class/elements/new-sc-line-gen-rs-static-async-generator-method-privatename-identifier.js":                         true,
-		"test/language/expressions/class/elements/new-sc-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                     true,
-		"test/language/expressions/class/elements/after-same-line-static-gen-rs-static-async-generator-method-privatename-identifier.js":              true,
-		"test/language/expressions/class/elements/after-same-line-static-gen-rs-static-async-generator-method-privatename-identifier-alt.js":          true,
-		"test/language/expressions/class/elements/after-same-line-gen-rs-static-async-generator-method-privatename-identifier.js":                     true,
-		"test/language/expressions/class/elements/after-same-line-gen-rs-static-async-generator-method-privatename-identifier-alt.js":                 true,
-		"test/built-ins/GeneratorFunction/is-a-constructor.js":                                                                                        true,
 
-		// async iterator
-		"test/language/expressions/optional-chaining/iteration-statement-for-await-of.js": true,
 
 		// legacy number literals
 		"test/language/literals/numeric/non-octal-decimal-integer.js": true,
@@ -283,8 +246,6 @@ var (
 	}
 
 	featuresBlackList = []string{
-		"async-iteration",
-		"Symbol.asyncIterator",
 		"resizable-arraybuffer",
 		"regexp-duplicate-named-groups",
 		"regexp-unicode-property-escapes",
@@ -363,34 +324,10 @@ func init() {
 
 	skip(
 		// generators and async generators (harness/hidden-constructors.js)
-		"test/built-ins/Async",
 
 		// async generators
-		"test/language/statements/class/elements/wrapped-in-sc-rs-static-async-generator-",
-		"test/language/statements/class/elements/same-line-method-rs-static-async-generator-",
-		"test/language/statements/class/elements/regular-definitions-rs-static-async-generator-",
-		"test/language/statements/class/elements/private-static-async-generator-",
-		"test/language/statements/class/elements/new-sc-line-method-rs-static-async-generator-",
-		"test/language/statements/class/elements/multiple-stacked-definitions-rs-static-async-generator-",
-		"test/language/statements/class/elements/new-no-sc-line-method-rs-static-async-generator-",
-		"test/language/statements/class/elements/multiple-definitions-rs-static-async-generator-",
-		"test/language/statements/class/elements/after-same-line-static-method-rs-static-async-generator-",
-		"test/language/statements/class/elements/after-same-line-method-rs-static-async-generator-",
-		"test/language/statements/class/elements/after-same-line-static-method-rs-static-async-generator-",
 
-		"test/language/expressions/class/elements/wrapped-in-sc-rs-static-async-generator-",
-		"test/language/expressions/class/elements/same-line-method-rs-static-async-generator-",
-		"test/language/expressions/class/elements/regular-definitions-rs-static-async-generator-",
-		"test/language/expressions/class/elements/private-static-async-generator-",
-		"test/language/expressions/class/elements/new-sc-line-method-rs-static-async-generator-",
-		"test/language/expressions/class/elements/multiple-stacked-definitions-rs-static-async-generator-",
-		"test/language/expressions/class/elements/new-no-sc-line-method-rs-static-async-generator-",
-		"test/language/expressions/class/elements/multiple-definitions-rs-static-async-generator-",
-		"test/language/expressions/class/elements/after-same-line-static-method-rs-static-async-generator-",
-		"test/language/expressions/class/elements/after-same-line-method-rs-static-async-generator-",
-		"test/language/expressions/class/elements/after-same-line-static-method-rs-static-async-generator-",
 
-		"test/language/eval-code/direct/async-gen-",
 
 		// restricted unicode regexp syntax
 		"test/language/literals/regexp/u-",

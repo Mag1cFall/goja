@@ -777,12 +777,21 @@ func (self *_parser) scanString(offset int, parse bool) (literal string, parsed 
 	return
 
 newline:
-	self.scanNewline()
 	errStr := "String not terminated"
 	if quote == '/' {
+		self.scanNewline()
 		errStr = "Invalid regular expression: missing /"
 		self.error(self.idxOf(offset), errStr)
+		return "", "", errStr
 	}
+	if self.chr < 0 {
+		errStr = string(quote) + string(quote) + " literal not terminated before end of script"
+	} else {
+		errStr = string(quote) + string(quote) + " string literal contains an unescaped line break"
+	}
+	errIdx := self.idxOf(self.chrOffset)
+	self.scanNewline()
+	self.error(errIdx, errStr)
 	return "", "", errStr
 }
 

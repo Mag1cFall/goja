@@ -10,7 +10,7 @@ import (
 func (r *Runtime) makeDate(args []Value, utc bool) (t time.Time, valid bool) {
 	switch {
 	case len(args) >= 2:
-		t = time.Date(1970, time.January, 1, 0, 0, 0, 0, time.Local)
+		t = time.Date(1970, time.January, 1, 0, 0, 0, 0, r.timeLocation())
 		t, valid = _dateSetYear(t, FunctionCall{Arguments: args}, 0, utc)
 	case len(args) == 0:
 		t = r.now()
@@ -25,7 +25,7 @@ func (r *Runtime) makeDate(args []Value, utc bool) (t time.Time, valid bool) {
 		if !valid {
 			pv := toPrimitive(args[0])
 			if val, ok := pv.(String); ok {
-				return dateParse(val.String())
+				return dateParse(val.String(), r.timeLocation())
 			}
 			pv = pv.ToNumber()
 			var n int64
@@ -69,11 +69,11 @@ func (r *Runtime) builtin_newDate(args []Value, proto *Object) *Object {
 }
 
 func (r *Runtime) builtin_date(FunctionCall) Value {
-	return asciiString(dateFormat(r.now()))
+	return asciiString(r.formatLocalTime(r.now(), dateTimeLayout))
 }
 
 func (r *Runtime) date_parse(call FunctionCall) Value {
-	t, set := dateParse(call.Argument(0).toString().String())
+	t, set := dateParse(call.Argument(0).toString().String(), r.timeLocation())
 	if set {
 		return intToValue(timeToMsec(t))
 	}
@@ -102,7 +102,7 @@ func (r *Runtime) dateproto_toString(call FunctionCall) Value {
 	obj := r.toObject(call.This)
 	if d, ok := obj.self.(*dateObject); ok {
 		if d.isSet() {
-			return asciiString(d.time().Format(dateTimeLayout))
+			return asciiString(r.formatLocalTime(d.time(), dateTimeLayout))
 		} else {
 			return stringInvalidDate
 		}
@@ -190,7 +190,7 @@ func (r *Runtime) dateproto_toTimeString(call FunctionCall) Value {
 	obj := r.toObject(call.This)
 	if d, ok := obj.self.(*dateObject); ok {
 		if d.isSet() {
-			return asciiString(d.time().Format(timeLayout))
+			return asciiString(r.formatLocalTime(d.time(), timeLayout))
 		} else {
 			return stringInvalidDate
 		}
@@ -669,14 +669,14 @@ func _dateSetMilliseconds(year, mon, day, hours, min, sec int64, t time.Time, ca
 	if utc {
 		loc = time.UTC
 	} else {
-		loc = time.Local
+		loc = t.Location()
 	}
 	r, ok := mkTime(year, mon, day, hours, min, sec, msec*1e6, loc)
 	if !ok {
 		return time.Time{}, false
 	}
 	if utc {
-		return r.In(time.Local), true
+		return r.In(t.Location()), true
 	}
 	return r, true
 }
@@ -908,7 +908,7 @@ func (r *Runtime) dateproto_setFullYear(call FunctionCall) Value {
 		if d.isSet() {
 			t = d.time()
 		} else {
-			t = time.Date(1970, time.January, 1, 0, 0, 0, 0, time.Local)
+			t = time.Date(1970, time.January, 1, 0, 0, 0, 0, r.timeLocation())
 		}
 		t, ok := _dateSetFullYear(t, limitCallArgs(call, 3), 0, false)
 		if !ok {
@@ -1048,6 +1048,7 @@ func getDateProtoTemplate() *objectTemplate {
 }
 
 func (r *Runtime) getDatePrototype() *Object {
+	r.resolveBuiltin("Date")
 	ret := r.global.DatePrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

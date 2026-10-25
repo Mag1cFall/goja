@@ -162,6 +162,9 @@ func (s *stringObject) getStr(name unistring.String, receiver Value) Value {
 	if i := strToGoIdx(name); i >= 0 && i < s.length {
 		return s._getIdx(i)
 	}
+	if name != "length" {
+		s.val.runtime.resolveBuiltin("String")
+	}
 	return s.baseObject.getStr(name, receiver)
 }
 

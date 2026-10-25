@@ -316,6 +316,7 @@ func (r *Runtime) createSetIterProto(val *Object) objectImpl {
 }
 
 func (r *Runtime) getSetIteratorPrototype() *Object {
+	r.resolveBuiltin("Iterator")
 	var o *Object
 	if o = r.global.SetIteratorPrototype; o == nil {
 		o = &Object{runtime: r}

@@ -1304,6 +1304,7 @@ func (r *Runtime) createRegExpStringIteratorPrototype(val *Object) objectImpl {
 }
 
 func (r *Runtime) getRegExpStringIteratorPrototype() *Object {
+	r.resolveBuiltin("Iterator")
 	var o *Object
 	if o = r.global.RegExpStringIteratorPrototype; o == nil {
 		o = &Object{runtime: r}
@@ -1328,6 +1329,7 @@ func (r *Runtime) getRegExp() *Object {
 }
 
 func (r *Runtime) getRegExpPrototype() *Object {
+	r.resolveBuiltin("RegExp")
 	ret := r.global.RegExpPrototype
 	if ret == nil {
 		o := r.newGuardedObject(r.global.ObjectPrototype, classObject)
@@ -1383,9 +1385,9 @@ func (r *Runtime) getRegExpPrototype() *Object {
 
 		o._putSym(SymMatch, valueProp(r.newNativeFunc(r.regexpproto_stdMatcher, "[Symbol.match]", 1), true, false, true))
 		o._putSym(SymMatchAll, valueProp(r.newNativeFunc(r.regexpproto_stdMatcherAll, "[Symbol.matchAll]", 1), true, false, true))
+		o._putSym(SymReplace, valueProp(r.newNativeFunc(r.regexpproto_stdReplacer, "[Symbol.replace]", 2), true, false, true))
 		o._putSym(SymSearch, valueProp(r.newNativeFunc(r.regexpproto_stdSearch, "[Symbol.search]", 1), true, false, true))
 		o._putSym(SymSplit, valueProp(r.newNativeFunc(r.regexpproto_stdSplitter, "[Symbol.split]", 2), true, false, true))
-		o._putSym(SymReplace, valueProp(r.newNativeFunc(r.regexpproto_stdReplacer, "[Symbol.replace]", 2), true, false, true))
 		o.guard("exec", "global", "multiline", "ignoreCase", "unicode", "sticky")
 	}
 	return ret

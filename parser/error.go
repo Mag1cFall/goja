@@ -107,16 +107,16 @@ func (self *_parser) errorUnexpectedToken(tkn token.Token) error {
 	case token.BOOLEAN, token.NULL:
 		value = self.literal
 	case token.IDENTIFIER:
-		return self.error(self.idx, "Unexpected identifier")
+		return self.error(self.idx, "unexpected token: identifier")
 	case token.KEYWORD:
 		// TODO Might be a future reserved word
 		return self.error(self.idx, "Unexpected reserved word")
 	case token.ESCAPED_RESERVED_WORD:
 		return self.error(self.idx, "Keyword must not contain escaped characters")
 	case token.NUMBER:
-		return self.error(self.idx, "Unexpected number")
+		return self.error(self.idx, "unexpected token: numeric literal")
 	case token.STRING:
-		return self.error(self.idx, "Unexpected string")
+		return self.error(self.idx, "unexpected token: string literal")
 	}
 	return self.error(self.idx, err_UnexpectedToken, value)
 }

@@ -2,6 +2,7 @@ package goja
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 
 	"github.com/Mag1cFall/goja/token"
@@ -46,9 +47,10 @@ const (
 const thisBindingName = " this" // must not be a valid identifier
 
 type CompilerError struct {
-	Message string
-	File    *file.File
-	Offset  int
+	Message  string
+	File     *file.File
+	Offset   int
+	Position file.Position
 }
 
 type CompilerSyntaxError struct {
@@ -70,15 +72,97 @@ type srcMapItem struct {
 type Program struct {
 	code []instruction
 
-	funcName unistring.String
-	src      *file.File
-	srcMap   []srcMapItem
+	funcName    unistring.String
+	displayName unistring.String
+	src         *file.File
+	srcMap      []srcMapItem
+	calleeText  map[int]string
+	// regexps 表示实例化本段代码时需要创建正则字面量对象，包含随其编译的立即调用函数
+	regexps bool
+	// generators 表示本段代码及其全部嵌套函数中含有同步生成器函数
+	generators bool
+	// warmUp 是 SpiderMonkey 意义上的预热计数，函数进入与每次经过循环头各加 1
+	warmUp int
+	// entries 是函数进入的次数
+	entries int
+	// ionEntry 是预热计数达到 Ion 阈值后改用 Ion 代码的进入序号，为 0 时尚未触发编译
+	ionEntry int
+	// ion 表示函数已改用 Ion 代码
+	ion bool
+	// failedSites 是属性访问出过错的指令位置
+	failedSites map[int]bool
+	// icSites 是触发 Ion 编译时 failedSites 的快照，Ion 代码中这些位置出错时不反编译基址表达式
+	icSites map[int]bool
+	// bailouts 是 Ion 代码中其余位置出错退回基线的次数
+	bailouts int
+	// host 表示代码是代表浏览器原生实现的宿主脚本，不计预热
+	host bool
+}
+
+// ionWarmUpThreshold 是 SpiderMonkey 触发 Ion 编译的预热计数
+const ionWarmUpThreshold = 1500
+
+// ionCompileEntries 是 Ion 后台编译期间函数仍以基线代码进入的次数
+const ionCompileEntries = 40
+
+// ionBailoutThreshold 是 Ion 代码累计退回基线后作废的次数
+const ionBailoutThreshold = 10
+
+// baselineWarmUpThreshold 是 SpiderMonkey 基线编译的预热计数，Ion 代码作废后预热计数回落到该值
+const baselineWarmUpThreshold = 100
+
+// enterFunction 在函数进入时累计预热计数，后台编译结束后的下一次进入改用 Ion 代码
+func (p *Program) enterFunction() {
+	if p.host {
+		return
+	}
+	p.entries++
+	p.countWarmUp()
+	if !p.ion && p.ionEntry != 0 && p.entries > p.ionEntry {
+		p.ion = true
+	}
+}
+
+// countWarmUp 累计一次预热，达到 Ion 阈值时记录改用 Ion 代码的进入序号
+func (p *Program) countWarmUp() {
+	if p.host {
+		return
+	}
+	p.warmUp++
+	if p.ionEntry == 0 && p.warmUp >= ionWarmUpThreshold {
+		p.ionEntry = p.entries + ionCompileEntries
+		p.icSites = maps.Clone(p.failedSites)
+	}
+}
+
+// failAccess 记录 pc 处的属性访问出错，返回 Ion 代码是否在该位置以不反编译基址的方式报错
+func (p *Program) failAccess(pc int) bool {
+	if p.ion && p.icSites[pc] {
+		return true
+	}
+	if p.failedSites == nil {
+		p.failedSites = make(map[int]bool)
+	}
+	p.failedSites[pc] = true
+	if p.ion {
+		p.bailouts++
+		if p.bailouts >= ionBailoutThreshold {
+			p.ion, p.ionEntry, p.bailouts = false, 0, 0
+			p.warmUp = min(p.warmUp, baselineWarmUpThreshold)
+		}
+	}
+	return false
 }
 
 type compiler struct {
 	p     *Program
 	scope *scope
 	block *block
+	// host 表示正在编译宿主脚本，新建的函数代码都不计预热
+	host bool
+
+	guessedNames map[file.Idx]unistring.String
+	separator    file.Idx
 
 	classScope *classScope
 
@@ -90,6 +174,11 @@ type compiler struct {
 	codeScratchpad []instruction
 
 	stringCache map[unistring.String]Value
+
+	// lazy 表示当前编译的代码属于 SpiderMonkey 首次调用时才编译的函数
+	lazy bool
+	// inFunc 表示当前编译的代码位于函数体内
+	inFunc bool
 }
 
 type binding struct {
@@ -310,6 +399,8 @@ type scope struct {
 	argsInStash bool
 	// need 'arguments' object (functions only)
 	argsNeeded bool
+	// asyncGenerator 表示函数作用域属于异步生成器函数
+	asyncGenerator bool
 }
 
 type block struct {
@@ -321,6 +412,8 @@ type block struct {
 	outer      *block
 	breaking   *block // set when the 'finally' block is an empty break statement sequence
 	needResult bool
+	// async 表示 for await 循环
+	async bool
 }
 
 func (c *compiler) leaveScopeBlock(enter *enterBlock) {
@@ -850,6 +943,13 @@ func (s *scope) trimCode(delta int) {
 		for i := range srcMap {
 			srcMap[i].pc -= delta
 		}
+		if texts := s.c.p.calleeText; texts != nil {
+			shifted := make(map[int]string, len(texts))
+			for pc, text := range texts {
+				shifted[pc-delta] = text
+			}
+			s.c.p.calleeText = shifted
+		}
 		s.adjustBase(-delta)
 	}
 }
@@ -910,6 +1010,7 @@ found:
 
 func (c *compiler) compile(in *ast.Program, strict, inGlobal bool, evalVm *vm) {
 	c.ctxVM = evalVm
+	c.guessedNames = guessFunctionNames(in)
 
 	eval := evalVm != nil
 	c.p.src = in.File
@@ -1350,17 +1451,30 @@ func (c *compiler) enterDummyMode() (leaveFunc func()) {
 		}
 	}
 	c.p = &Program{
-		src: c.p.src,
+		src:  c.p.src,
+		host: c.host,
 	}
+	dummy := c.p
 	c.newScope()
 	return func() {
 		c.block, c.p = savedBlock, savedProgram
+		c.p.generators = c.p.generators || dummy.generators
 		c.popScope()
 	}
 }
 
-func (c *compiler) compileStatementDummy(statement ast.Statement) {
+// enterUnreachableMode 编译 SpiderMonkey 不折叠的不可达代码，保留其正则字面量标记
+func (c *compiler) enterUnreachableMode() (leaveFunc func()) {
 	leave := c.enterDummyMode()
+	dummy := c.p
+	return func() {
+		leave()
+		c.p.regexps = c.p.regexps || dummy.regexps
+	}
+}
+
+func (c *compiler) compileStatementDummy(statement ast.Statement) {
+	leave := c.enterUnreachableMode()
 	c.compileStatement(statement, false)
 	leave()
 }

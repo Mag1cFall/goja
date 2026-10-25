@@ -358,6 +358,7 @@ func getBigIntProtoTemplate() *objectTemplate {
 }
 
 func (r *Runtime) getBigIntPrototype() *Object {
+	r.resolveBuiltin("BigInt")
 	ret := r.global.BigIntPrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

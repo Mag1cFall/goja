@@ -312,6 +312,7 @@ func (r *Runtime) createMapIterProto(val *Object) objectImpl {
 }
 
 func (r *Runtime) getMapIteratorPrototype() *Object {
+	r.resolveBuiltin("Iterator")
 	var o *Object
 	if o = r.global.MapIteratorPrototype; o == nil {
 		o = &Object{runtime: r}

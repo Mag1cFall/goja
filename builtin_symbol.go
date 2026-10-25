@@ -15,6 +15,9 @@ var (
 	SymToPrimitive        = newSymbol(asciiString("Symbol.toPrimitive"))
 	SymToStringTag        = newSymbol(asciiString("Symbol.toStringTag"))
 	SymUnscopables        = newSymbol(asciiString("Symbol.unscopables"))
+	SymAsyncIterator      = newSymbol(asciiString("Symbol.asyncIterator"))
+	SymDispose            = newSymbol(asciiString("Symbol.dispose"))
+	SymAsyncDispose       = newSymbol(asciiString("Symbol.asyncDispose"))
 )
 
 func (r *Runtime) builtin_symbol(call FunctionCall) Value {
@@ -147,16 +150,21 @@ func (r *Runtime) createSymbol(val *Object) objectImpl {
 		SymToPrimitive,
 		SymToStringTag,
 		SymUnscopables,
+		SymAsyncIterator,
+		SymDispose,
+		SymAsyncDispose,
 	} {
 		n := s.desc.(asciiString)
 		n = n[len("Symbol."):]
 		o._putProp(unistring.String(n), s, false, false, false)
 	}
+	o.orderOwnKeys("for", "keyFor", "prototype", "isConcatSpreadable", "iterator", "match", "replace", "search", "species", "hasInstance", "split", "toPrimitive", "toStringTag", "unscopables", "asyncIterator", "matchAll", "dispose", "asyncDispose", "length", "name")
 
 	return o
 }
 
 func (r *Runtime) getSymbolPrototype() *Object {
+	r.resolveBuiltin("Symbol")
 	ret := r.global.SymbolPrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

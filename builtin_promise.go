@@ -39,11 +39,10 @@ type promiseCapability struct {
 }
 
 type promiseReaction struct {
-	capability  *promiseCapability
-	typ         promiseReactionType
-	handler     *jobCallback
-	asyncRunner *asyncRunner
-	asyncCtx    interface{}
+	capability *promiseCapability
+	typ        promiseReactionType
+	handler    *jobCallback
+	asyncCtx   interface{}
 }
 
 var typePromise = reflect.TypeOf((*Promise)(nil))
@@ -76,7 +75,7 @@ func (p *Promise) toValue(r *Runtime) Value {
 		return _null
 	}
 	promise := p.val
-	if promise.runtime != r {
+	if promise.runtime != r && promise.runtime.vm != r.vm {
 		panic(r.NewTypeError("Illegal runtime transition of a Promise"))
 	}
 	return promise
@@ -188,7 +187,7 @@ func (r *Runtime) newPromiseResolveThenableJob(p *Promise, thenable Value, then 
 }
 
 func (r *Runtime) enqueuePromiseJob(job func()) {
-	r.jobQueue = append(r.jobQueue, job)
+	r.QueueMicrotask(job)
 }
 
 func (r *Runtime) triggerPromiseReactions(reactions []*promiseReaction, argument Value) {
@@ -342,9 +341,11 @@ func (r *Runtime) promiseProto_catch(call FunctionCall) Value {
 
 func (r *Runtime) promiseResolve(c *Object, x Value) *Object {
 	if obj, ok := x.(*Object); ok {
-		xConstructor := nilSafe(obj.self.getStr("constructor", nil))
-		if xConstructor.SameAs(c) {
-			return obj
+		if _, ok := obj.self.(*Promise); ok {
+			xConstructor := nilSafe(obj.self.getStr("constructor", nil))
+			if xConstructor.SameAs(c) {
+				return obj
+			}
 		}
 	}
 	pcap := r.newPromiseCapability(c)

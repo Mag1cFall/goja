@@ -119,6 +119,7 @@ func (r *Runtime) createWeakSet(val *Object) objectImpl {
 }
 
 func (r *Runtime) getWeakSetPrototype() *Object {
+	r.resolveBuiltin("WeakSet")
 	ret := r.global.WeakSetPrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

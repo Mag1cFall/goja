@@ -352,6 +352,7 @@ func createGlobalObjectTemplate() *objectTemplate {
 	t.putStr("ReferenceError", func(r *Runtime) Value { return valueProp(r.getReferenceError(), true, false, true) })
 	t.putStr("SyntaxError", func(r *Runtime) Value { return valueProp(r.getSyntaxError(), true, false, true) })
 	t.putStr("RangeError", func(r *Runtime) Value { return valueProp(r.getRangeError(), true, false, true) })
+	t.putStr("InternalError", func(r *Runtime) Value { return valueProp(r.getInternalError(), true, false, true) })
 	t.putStr("EvalError", func(r *Runtime) Value { return valueProp(r.getEvalError(), true, false, true) })
 	t.putStr("URIError", func(r *Runtime) Value { return valueProp(r.getURIError(), true, false, true) })
 	t.putStr("GoError", func(r *Runtime) Value { return valueProp(r.getGoError(), true, false, true) })

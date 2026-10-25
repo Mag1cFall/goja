@@ -3,6 +3,7 @@ package goja
 import (
 	"math"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -25,7 +26,7 @@ type dateObject struct {
 	msec int64
 }
 
-func dateParse(date string) (t time.Time, ok bool) {
+func dateParse(date string, local *time.Location) (t time.Time, ok bool) {
 	d, ok := parseDateISOString(date)
 	if !ok {
 		d, ok = parseDateOtherString(date)
@@ -45,7 +46,7 @@ func dateParse(date string) (t time.Time, ok bool) {
 	}
 	var loc *time.Location
 	if d.isLocal {
-		loc = time.Local
+		loc = local
 	} else {
 		loc = time.FixedZone("", d.timeZoneOffset*60)
 	}
@@ -72,8 +73,13 @@ func (r *Runtime) newDateObject(t time.Time, isSet bool, proto *Object) *Object 
 	return v
 }
 
-func dateFormat(t time.Time) string {
-	return t.Local().Format(dateTimeLayout)
+// formatLocalTime 按 Realm 时区格式化本地时间，带时区注释的格式使用 Realm 的时区显示名
+func (r *Runtime) formatLocalTime(t time.Time, layout string) string {
+	t = t.In(r.timeLocation())
+	if r.timeZoneName != nil && strings.HasSuffix(layout, " (MST)") {
+		return t.Format(strings.TrimSuffix(layout, " (MST)")) + " (" + r.timeZoneName(t) + ")"
+	}
+	return t.Format(layout)
 }
 
 func timeFromMsec(msec int64) time.Time {
@@ -116,9 +122,26 @@ func (d *dateObject) unset() {
 }
 
 func (d *dateObject) time() time.Time {
-	return timeFromMsec(d.msec)
+	return timeFromMsec(d.msec).In(d.val.runtime.timeLocation())
 }
 
 func (d *dateObject) timeUTC() time.Time {
 	return timeFromMsec(d.msec).In(time.UTC)
+}
+
+// SetTimeLocation 设置 Date 本地时间使用的时区
+func (r *Runtime) SetTimeLocation(location *time.Location) {
+	r.location = location
+}
+
+// SetTimeZoneName 设置 Date 字符串中时区注释的显示名
+func (r *Runtime) SetTimeZoneName(name func(time.Time) string) {
+	r.timeZoneName = name
+}
+
+func (r *Runtime) timeLocation() *time.Location {
+	if r.location != nil {
+		return r.location
+	}
+	return time.Local
 }

@@ -13,19 +13,14 @@ const (
 )
 
 func FToBaseStr(num float64, radix int) string {
-	var negative bool
 	if num < 0 {
-		num = -num
-		negative = true
+		return "-" + FToBaseStr(-num, radix)
 	}
 
 	dfloor := math.Floor(num)
 	ldfloor := int64(dfloor)
 	var intDigits string
 	if dfloor == float64(ldfloor) {
-		if negative {
-			ldfloor = -ldfloor
-		}
 		intDigits = strconv.FormatInt(ldfloor, radix)
 	} else {
 		floorBits := math.Float64bits(num)
@@ -37,9 +32,6 @@ func FToBaseStr(num float64, radix int) string {
 			mantissa = int64((floorBits & frac_maskL) | exp_msk1L)
 		}
 
-		if negative {
-			mantissa = -mantissa
-		}
 		exp -= 1075
 		x := big.NewInt(mantissa)
 		if exp > 0 {

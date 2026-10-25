@@ -192,6 +192,7 @@ func (r *Runtime) createWeakMap(val *Object) objectImpl {
 }
 
 func (r *Runtime) getWeakMapPrototype() *Object {
+	r.resolveBuiltin("WeakMap")
 	ret := r.global.WeakMapPrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

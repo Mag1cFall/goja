@@ -83,7 +83,7 @@ func (r *Runtime) builtin_newArray(args []Value, proto *Object) *Object {
 			if float64(al) == float64(f) {
 				return r.newArrayLength(al)
 			} else {
-				panic(r.newError(r.getRangeError(), "Invalid array length"))
+				panic(r.newError(r.getRangeError(), "invalid array length"))
 			}
 		}
 		return setArrayValues(r.newArray(proto), []Value{args[0]}).val
@@ -98,7 +98,7 @@ func (r *Runtime) generic_push(obj *Object, call FunctionCall) Value {
 	l := toLength(obj.self.getStr("length", nil))
 	nl := l + int64(len(call.Arguments))
 	if nl >= maxInt {
-		r.typeErrorResult(true, "Invalid array length")
+		r.typeErrorResult(true, "invalid array length")
 		panic("unreachable")
 	}
 	for i, arg := range call.Arguments {
@@ -250,12 +250,13 @@ func (r *Runtime) arrayproto_toString(call FunctionCall) Value {
 	})
 }
 
-func (r *Runtime) writeItemLocaleString(item Value, buf *StringBuilder) {
+func (r *Runtime) writeItemLocaleString(item Value, buf *StringBuilder, args []Value) {
 	if item != nil && item != _undefined && item != _null {
 		if f, ok := r.getVStr(item, "toLocaleString").(*Object); ok {
 			if c, ok := f.self.assertCallable(); ok {
 				strVal := c(FunctionCall{
-					This: item,
+					This:      item,
+					Arguments: args,
 				})
 				buf.WriteString(strVal.toString())
 				return
@@ -274,13 +275,14 @@ func (r *Runtime) arrayproto_toLocaleString(call FunctionCall) Value {
 	}
 	defer r.popFromStringStack()
 
+	args := []Value{call.Argument(0), call.Argument(1)}
 	var buf StringBuilder
 	if a := r.checkStdArrayObj(array); a != nil {
 		for i, item := range a.values {
 			if i > 0 {
 				buf.WriteRune(',')
 			}
-			r.writeItemLocaleString(item, &buf)
+			r.writeItemLocaleString(item, &buf, args)
 		}
 	} else {
 		length := toLength(array.self.getStr("length", nil))
@@ -289,7 +291,7 @@ func (r *Runtime) arrayproto_toLocaleString(call FunctionCall) Value {
 				buf.WriteRune(',')
 			}
 			item := array.self.getIdx(valueInt(i), nil)
-			r.writeItemLocaleString(item, &buf)
+			r.writeItemLocaleString(item, &buf, args)
 		}
 	}
 
@@ -309,7 +311,7 @@ func (r *Runtime) arrayproto_concat_append(a *Object, item Value) {
 	if obj, ok := item.(*Object); ok && isConcatSpreadable(obj) {
 		length := toLength(obj.self.getStr("length", nil))
 		if aLength+length >= maxInt {
-			panic(r.NewTypeError("Invalid array length"))
+			panic(r.NewTypeError("invalid array length"))
 		}
 		for i := int64(0); i < length; i++ {
 			v := obj.self.getIdx(valueInt(i), nil)
@@ -443,7 +445,7 @@ func (r *Runtime) arrayproto_splice(call FunctionCall) Value {
 	itemCount := max(int64(len(call.Arguments)-2), 0)
 	newLength := length - actualDeleteCount + itemCount
 	if newLength >= maxInt {
-		panic(r.NewTypeError("Invalid array length"))
+		panic(r.NewTypeError("invalid array length"))
 	}
 	a := arraySpeciesCreate(o, actualDeleteCount)
 	if src := r.checkStdArrayObj(o); src != nil {
@@ -537,7 +539,7 @@ func (r *Runtime) arrayproto_unshift(call FunctionCall) Value {
 	if argCount > 0 {
 		newSize := length + argCount
 		if newSize >= maxInt {
-			panic(r.NewTypeError("Invalid array length"))
+			panic(r.NewTypeError("invalid array length"))
 		}
 		if arr := r.checkStdArrayObjWithProto(o); arr != nil && newSize < math.MaxUint32 {
 			if int64(cap(arr.values)) >= newSize {
@@ -1225,7 +1227,7 @@ func (r *Runtime) flattenIntoArray(target, source *Object, sourceLen, start, dep
 				targetIndex = r.flattenIntoArray(target, elementArray, elementLen, targetIndex, depth-1, nil, nil)
 			} else {
 				if targetIndex >= maxInt-1 {
-					panic(r.NewTypeError("Invalid array length"))
+					panic(r.NewTypeError("invalid array length"))
 				}
 				createDataPropertyOrThrow(target, intToValue(targetIndex), element)
 				targetIndex++
@@ -1333,7 +1335,7 @@ func (r *Runtime) arrayproto_toSorted(call FunctionCall) Value {
 	o := call.This.ToObject(r)
 	length := toLength(o.self.getStr("length", nil))
 	if length >= math.MaxUint32 {
-		panic(r.newError(r.getRangeError(), "Invalid array length"))
+		panic(r.newError(r.getRangeError(), "invalid array length"))
 	}
 	var a []Value
 
@@ -1371,7 +1373,7 @@ func (r *Runtime) arrayproto_toSpliced(call FunctionCall) Value {
 	itemCount := max(int64(len(call.Arguments)-2), 0)
 	newLength := length - actualSkipCount + itemCount
 	if newLength >= maxInt {
-		panic(r.NewTypeError("Invalid array length"))
+		panic(r.NewTypeError("invalid array length"))
 	}
 
 	if src := r.checkStdArrayObj(o); src != nil {
@@ -1714,7 +1716,8 @@ func (r *Runtime) createArray(val *Object) objectImpl {
 func (r *Runtime) createArrayIterProto(val *Object) objectImpl {
 	o := newBaseObjectObj(val, r.getIteratorPrototype(), classObject)
 
-	o._putProp("next", r.newNativeFunc(r.arrayIterProto_next, "next", 0), true, false, true)
+	r.global.arrayIterNext = r.newNativeFunc(r.arrayIterProto_next, "next", 0)
+	o._putProp("next", r.global.arrayIterNext, true, false, true)
 	o._putSym(SymToStringTag, valueProp(asciiString(classArrayIterator), false, false, true))
 
 	return o
@@ -1739,6 +1742,7 @@ func (r *Runtime) getArrayToString() *Object {
 }
 
 func (r *Runtime) getArrayIteratorPrototype() *Object {
+	r.resolveBuiltin("Iterator")
 	var o *Object
 	if o = r.global.ArrayIteratorPrototype; o == nil {
 		o = &Object{runtime: r}

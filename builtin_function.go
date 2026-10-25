@@ -6,6 +6,9 @@ import (
 )
 
 func (r *Runtime) functionCtor(args []Value, proto *Object, async, generator bool) *Object {
+	if r.functionTransformer != nil {
+		args = r.functionTransformer(args)
+	}
 	var sb StringBuilder
 	if async {
 		if generator {
@@ -53,7 +56,13 @@ func (r *Runtime) builtin_generatorFunction(args []Value, proto *Object) *Object
 }
 
 func (r *Runtime) functionproto_toString(call FunctionCall) Value {
-	obj := r.toObject(call.This)
+	if call.This == _null || call.This == _undefined || call.This == nil {
+		panic(r.NewTypeError("can't convert %s to object", nilSafe(call.This).String()))
+	}
+	obj, isObject := call.This.(*Object)
+	if !isObject {
+		panic(r.NewTypeError("Function.prototype.toString called on incompatible object"))
+	}
 	switch f := obj.self.(type) {
 	case funcObjectImpl:
 		return f.source()
@@ -62,7 +71,7 @@ func (r *Runtime) functionproto_toString(call FunctionCall) Value {
 			return asciiString("function () { [native code] }")
 		}
 	}
-	panic(r.NewTypeError("Function.prototype.toString requires that 'this' be a Function"))
+	panic(r.NewTypeError("Function.prototype.toString called on incompatible object"))
 }
 
 func (r *Runtime) functionproto_hasInstance(call FunctionCall) Value {
@@ -307,7 +316,7 @@ func (r *Runtime) getAsyncFunctionPrototype() *Object {
 
 func (r *Runtime) createAsyncFunction(val *Object) objectImpl {
 	o := r.newNativeFuncConstructObj(val, r.builtin_asyncFunction, "AsyncFunction", r.getAsyncFunctionPrototype(), 1)
-
+	o.prototype = r.getFunction()
 	return o
 }
 
@@ -370,6 +379,7 @@ func (r *Runtime) getGeneratorFunctionPrototype() *Object {
 
 func (r *Runtime) createGeneratorFunction(val *Object) objectImpl {
 	o := r.newNativeFuncConstructObj(val, r.builtin_generatorFunction, "GeneratorFunction", r.getGeneratorFunctionPrototype(), 1)
+	o.prototype = r.getFunction()
 	return o
 }
 
@@ -397,6 +407,7 @@ func (r *Runtime) createGeneratorProto(val *Object) objectImpl {
 }
 
 func (r *Runtime) getGeneratorPrototype() *Object {
+	r.resolveBuiltin("Iterator")
 	var o *Object
 	if o = r.global.GeneratorPrototype; o == nil {
 		o = &Object{runtime: r}

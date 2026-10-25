@@ -50,6 +50,7 @@ func (r *Runtime) booleanproto_valueOf(call FunctionCall) Value {
 }
 
 func (r *Runtime) getBooleanPrototype() *Object {
+	r.resolveBuiltin("Boolean")
 	ret := r.global.BooleanPrototype
 	if ret == nil {
 		ret = r.newPrimitiveObject(valueFalse, r.global.ObjectPrototype, classBoolean)

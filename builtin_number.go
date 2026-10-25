@@ -65,7 +65,7 @@ func (r *Runtime) numberproto_toString(call FunctionCall) Value {
 	}
 
 	if radix < 2 || radix > 36 {
-		panic(r.newError(r.getRangeError(), "toString() radix argument must be between 2 and 36"))
+		panic(r.newError(r.getRangeError(), "radix must be an integer at least 2 and no greater than 36"))
 	}
 
 	num := numVal.ToFloat()
@@ -225,6 +225,7 @@ func getNumberProtoTemplate() *objectTemplate {
 }
 
 func (r *Runtime) getNumberPrototype() *Object {
+	r.resolveBuiltin("Number")
 	ret := r.global.NumberPrototype
 	if ret == nil {
 		ret = &Object{runtime: r}

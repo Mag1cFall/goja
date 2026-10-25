@@ -125,8 +125,6 @@ var (
 		"test/language/literals/regexp/S7.8.5_A2.1_T2.js":            true,
 		"test/language/literals/regexp/S7.8.5_A2.4_T2.js":            true,
 
-
-
 		// legacy number literals
 		"test/language/literals/numeric/non-octal-decimal-integer.js": true,
 		"test/language/literals/string/S7.8.4_A4.3_T2.js":             true,
@@ -323,12 +321,6 @@ func init() {
 	}
 
 	skip(
-		// generators and async generators (harness/hidden-constructors.js)
-
-		// async generators
-
-
-
 		// restricted unicode regexp syntax
 		"test/language/literals/regexp/u-",
 

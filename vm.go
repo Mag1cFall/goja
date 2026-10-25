@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dop251/goja/unistring"
+	"github.com/Mag1cFall/goja/unistring"
 )
 
 const (

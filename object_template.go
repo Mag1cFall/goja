@@ -2,7 +2,7 @@ package goja
 
 import (
 	"fmt"
-	"github.com/dop251/goja/unistring"
+	"github.com/Mag1cFall/goja/unistring"
 	"math"
 	"reflect"
 	"sort"

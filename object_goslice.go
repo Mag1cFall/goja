@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/dop251/goja/unistring"
+	"github.com/Mag1cFall/goja/unistring"
 )
 
 type objectGoSlice struct {

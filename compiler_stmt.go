@@ -1,10 +1,10 @@
 package goja
 
 import (
-	"github.com/dop251/goja/ast"
-	"github.com/dop251/goja/file"
-	"github.com/dop251/goja/token"
-	"github.com/dop251/goja/unistring"
+	"github.com/Mag1cFall/goja/ast"
+	"github.com/Mag1cFall/goja/file"
+	"github.com/Mag1cFall/goja/token"
+	"github.com/Mag1cFall/goja/unistring"
 )
 
 func (c *compiler) compileStatement(v ast.Statement, needResult bool) {

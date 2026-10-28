@@ -146,10 +146,8 @@ func (c *compiler) compileTryStatement(v *ast.TryStatement, needResult bool) {
 			}
 			c.createBindings(v.Catch.Parameter, func(name unistring.String, offset int) {
 				if c.scope.strict {
-					switch name {
-					case "arguments", "eval":
-						c.throwSyntaxError(offset, "Catch variable may not be eval or arguments in strict mode")
-					}
+					c.checkIdentifierLName(name, offset)
+					c.checkIdentifierName(name, offset)
 				}
 				c.scope.bindNameLexical(name, true, offset)
 			})
@@ -784,7 +782,7 @@ func (c *compiler) compileIfStatement(v *ast.IfStatement, needResult bool) {
 
 func (c *compiler) compileReturnStatement(v *ast.ReturnStatement) {
 	if s := c.scope.nearestFunction(); s != nil && s.funcType == funcClsInit {
-		c.throwSyntaxError(int(v.Return)-1, "Illegal return statement")
+		c.throwSyntaxError(int(v.Return)-1, "return not in function")
 	}
 	if v.Argument != nil {
 		c.emitExpr(c.compileExpression(v.Argument), true)

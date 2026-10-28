@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/Mag1cFall/goja/unistring"
 )
@@ -26,6 +27,9 @@ type stash struct {
 	extraArgs []Value
 	names     map[unistring.String]uint32
 	obj       *Object
+
+	// scope 标识作用域的名称集合：指向创建作用域的指令中编译期名称表字段，运行期每次增删绑定后换为新的标识
+	scope *map[unistring.String]uint32
 
 	outer *stash
 
@@ -360,6 +364,8 @@ func (r *unresolvedRef) refname() unistring.String {
 }
 
 type vm struct {
+	// regionRegs 是整数区域执行时的寄存器
+	regionRegs   []int64
 	r            *Runtime
 	prg          *Program
 	pc           int
@@ -384,6 +390,82 @@ type vm struct {
 	interruptLock sync.Mutex
 
 	profTracker *profTracker
+
+	// intBlock 是整数装箱分块中尚未使用的槽位
+	intBlock []valueInt
+}
+
+// intBlockSize 是整数装箱分块的槽位数
+const intBlockSize = 64
+
+// valueIntTab 是 valueInt 实现 Value 接口的类型字
+var valueIntTab = func() unsafe.Pointer {
+	var v Value = valueInt(maxInt)
+	return (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[0]
+}()
+
+// intValue 与 intToValue 相同，缓存范围外的整数存入当前分块的下一个槽位，算术指令不必逐个分配
+func (vm *vm) intValue(i int64) Value {
+	if i >= intCacheLo && i < intCacheHi {
+		return intCache[i-intCacheLo]
+	}
+	if i < -maxInt || i > maxInt {
+		return valueFloat(i)
+	}
+	if len(vm.intBlock) == 0 {
+		vm.intBlock = make([]valueInt, intBlockSize)
+	}
+	slot := &vm.intBlock[0]
+	vm.intBlock = vm.intBlock[1:]
+	*slot = valueInt(i)
+	var v Value
+	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+	words[0], words[1] = valueIntTab, unsafe.Pointer(slot)
+	return v
+}
+
+// intOperands 在栈顶两个操作数都是 valueInt 时返回它们的值
+func (vm *vm) intOperands() (int64, int64, bool) {
+	left, ok := vm.stack[vm.sp-2].(valueInt)
+	if !ok {
+		return 0, 0, false
+	}
+	right, ok := vm.stack[vm.sp-1].(valueInt)
+	return int64(left), int64(right), ok
+}
+
+// mulInt 返回两个整数之积，零与负数之积为 -0，超出 int64 时按浮点相乘
+func (vm *vm) mulInt(left, right int64) Value {
+	if left == 0 || right == 0 {
+		if left < 0 || right < 0 {
+			return _negativeZero
+		}
+		return intToValue(0)
+	}
+	if product := left * right; product/left == right {
+		return vm.intValue(product)
+	}
+	return floatToValue(float64(left) * float64(right))
+}
+
+// modInt 返回两个整数的余数，除数为 0 时为 NaN，被除数为负且整除时为 -0
+func (vm *vm) modInt(left, right int64) Value {
+	if right == 0 {
+		return _NaN
+	}
+	remainder := left % right
+	if remainder == 0 && left < 0 {
+		return _negativeZero
+	}
+	return vm.intValue(remainder)
+}
+
+// truthy 返回值的 ToBoolean 结果，布尔值不经接口调用
+func truthy(v Value) bool {
+	if b, ok := v.(valueBool); ok {
+		return bool(b)
+	}
+	return v.ToBoolean()
 }
 
 type instruction interface {
@@ -566,6 +648,7 @@ func (s *stash) createBinding(name unistring.String, deletable bool) {
 		s.names = make(map[unistring.String]uint32)
 	}
 	if _, exists := s.names[name]; !exists {
+		s.scope = new(map[unistring.String]uint32)
 		idx := uint32(len(s.names)) | maskVar
 		if deletable {
 			idx |= maskDeletable
@@ -580,6 +663,7 @@ func (s *stash) createLexBinding(name unistring.String, isConst bool) {
 		s.names = make(map[unistring.String]uint32)
 	}
 	if _, exists := s.names[name]; !exists {
+		s.scope = new(map[unistring.String]uint32)
 		idx := uint32(len(s.names))
 		if isConst {
 			idx |= maskConst | maskStrict
@@ -590,6 +674,7 @@ func (s *stash) createLexBinding(name unistring.String, isConst bool) {
 }
 
 func (s *stash) deleteBinding(name unistring.String) {
+	s.scope = new(map[unistring.String]uint32)
 	delete(s.names, name)
 }
 
@@ -937,6 +1022,16 @@ func (vm *vm) toCallee(v Value) *Object {
 	panic(vm.r.NewTypeError("%s is not a function", vm.calleeText(v)))
 }
 
+// newCallee 返回 new 表达式被调值的构造函数，不可构造时按 SpiderMonkey 报告被调表达式的反编译文本
+func (vm *vm) newCallee(v Value) func(args []Value, newTarget *Object) *Object {
+	if obj, ok := v.(*Object); ok {
+		if ctor := obj.self.assertConstructor(); ctor != nil {
+			return ctor
+		}
+	}
+	panic(vm.r.NewTypeError("%s is not a constructor", vm.calleeText(v)))
+}
+
 // calleeText 返回当前调用指令被调用表达式的 SpiderMonkey 反编译文本
 func (vm *vm) calleeText(v Value) string {
 	if vm.prg != nil && vm.prg.calleeText != nil {
@@ -1253,6 +1348,12 @@ type _add struct{}
 var add _add
 
 func (_add) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(left + right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	right := vm.stack[vm.sp-1]
 	left := vm.stack[vm.sp-2]
 
@@ -1282,7 +1383,7 @@ func (_add) exec(vm *vm) {
 		case valueInt:
 			switch right := right.(type) {
 			case valueInt:
-				ret = intToValue(int64(left) + int64(right))
+				ret = vm.intValue(int64(left) + int64(right))
 			case *valueBigInt:
 				panic(errMixBigIntType)
 			default:
@@ -1312,6 +1413,12 @@ type _sub struct{}
 var sub _sub
 
 func (_sub) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(left - right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	right := vm.stack[vm.sp-1]
 	left := vm.stack[vm.sp-2]
 
@@ -1324,7 +1431,7 @@ func (_sub) exec(vm *vm) {
 	case valueInt:
 		switch right := right.(type) {
 		case valueInt:
-			result = intToValue(int64(left) - int64(right))
+			result = vm.intValue(int64(left) - int64(right))
 			goto end
 		case *valueBigInt:
 			panic(errMixBigIntType)
@@ -1353,6 +1460,12 @@ type _mul struct{}
 var mul _mul
 
 func (_mul) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.mulInt(left, right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 
@@ -1362,16 +1475,8 @@ func (_mul) exec(vm *vm) {
 	case valueInt:
 		switch right := right.(type) {
 		case valueInt:
-			if left == 0 && right == -1 || left == -1 && right == 0 {
-				result = _negativeZero
-				goto end
-			}
-			res := left * right
-			// check for overflow
-			if left == 0 || right == 0 || res/left == right {
-				result = intToValue(int64(res))
-				goto end
-			}
+			result = vm.mulInt(int64(left), int64(right))
+			goto end
 		case *valueBigInt:
 			panic(errMixBigIntType)
 		}
@@ -1513,6 +1618,12 @@ type _mod struct{}
 var mod _mod
 
 func (_mod) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.modInt(left, right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 
@@ -1522,16 +1633,7 @@ func (_mod) exec(vm *vm) {
 	case valueInt:
 		switch right := right.(type) {
 		case valueInt:
-			if right == 0 {
-				result = _NaN
-				goto end
-			}
-			r := left % right
-			if r == 0 && left < 0 {
-				result = _negativeZero
-			} else {
-				result = intToValue(int64(left % right))
-			}
+			result = vm.modInt(int64(left), int64(right))
 			goto end
 		case *valueBigInt:
 			panic(errMixBigIntType)
@@ -1614,7 +1716,7 @@ func (_inc) exec(vm *vm) {
 	case *valueBigInt:
 		v = (*valueBigInt)(new(big.Int).Add((*big.Int)(n), big.NewInt(1)))
 	case valueInt:
-		v = intToValue(int64(n + 1))
+		v = vm.intValue(int64(n + 1))
 	default:
 		v = valueFloat(n.ToFloat() + 1)
 	}
@@ -1634,7 +1736,7 @@ func (_dec) exec(vm *vm) {
 	case *valueBigInt:
 		v = (*valueBigInt)(new(big.Int).Sub((*big.Int)(n), big.NewInt(1)))
 	case valueInt:
-		v = intToValue(int64(n - 1))
+		v = vm.intValue(int64(n - 1))
 	default:
 		v = valueFloat(n.ToFloat() - 1)
 	}
@@ -1648,6 +1750,12 @@ type _and struct{}
 var and _and
 
 func (_and) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(int32(left) & int32(right)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 	var result Value
@@ -1662,7 +1770,7 @@ func (_and) exec(vm *vm) {
 		panic(errMixBigIntType)
 	}
 
-	result = intToValue(int64(toInt32(left) & toInt32(right)))
+	result = vm.intValue(int64(toInt32(left) & toInt32(right)))
 end:
 	vm.stack[vm.sp-2] = result
 	vm.sp--
@@ -1674,6 +1782,12 @@ type _or struct{}
 var or _or
 
 func (_or) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(int32(left) | int32(right)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 	var result Value
@@ -1688,7 +1802,7 @@ func (_or) exec(vm *vm) {
 		panic(errMixBigIntType)
 	}
 
-	result = intToValue(int64(toInt32(left) | toInt32(right)))
+	result = vm.intValue(int64(toInt32(left) | toInt32(right)))
 end:
 	vm.stack[vm.sp-2] = result
 	vm.sp--
@@ -1700,6 +1814,12 @@ type _xor struct{}
 var xor _xor
 
 func (_xor) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(int32(left) ^ int32(right)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 	var result Value
@@ -1714,7 +1834,7 @@ func (_xor) exec(vm *vm) {
 		panic(errMixBigIntType)
 	}
 
-	result = intToValue(int64(toInt32(left) ^ toInt32(right)))
+	result = vm.intValue(int64(toInt32(left) ^ toInt32(right)))
 end:
 	vm.stack[vm.sp-2] = result
 	vm.sp--
@@ -1731,7 +1851,7 @@ func (_bnot) exec(vm *vm) {
 	case *valueBigInt:
 		v = (*valueBigInt)(new(big.Int).Not((*big.Int)(n)))
 	default:
-		v = intToValue(int64(^toInt32(n)))
+		v = vm.intValue(int64(^toInt32(n)))
 	}
 	vm.stack[vm.sp-1] = v
 	vm.pc++
@@ -1742,6 +1862,12 @@ type _sal struct{}
 var sal _sal
 
 func (_sal) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(int32(left) << (uint32(right) & 0x1F)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 	var result Value
@@ -1761,7 +1887,7 @@ func (_sal) exec(vm *vm) {
 		panic(errMixBigIntType)
 	}
 
-	result = intToValue(int64(toInt32(left) << (toUint32(right) & 0x1F)))
+	result = vm.intValue(int64(toInt32(left) << (toUint32(right) & 0x1F)))
 end:
 	vm.stack[vm.sp-2] = result
 	vm.sp--
@@ -1773,6 +1899,12 @@ type _sar struct{}
 var sar _sar
 
 func (_sar) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(int32(left) >> (uint32(right) & 0x1F)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 	var result Value
@@ -1792,7 +1924,7 @@ func (_sar) exec(vm *vm) {
 		panic(errMixBigIntType)
 	}
 
-	result = intToValue(int64(toInt32(left) >> (toUint32(right) & 0x1F)))
+	result = vm.intValue(int64(toInt32(left) >> (toUint32(right) & 0x1F)))
 end:
 	vm.stack[vm.sp-2] = result
 	vm.sp--
@@ -1804,6 +1936,12 @@ type _shr struct{}
 var shr _shr
 
 func (_shr) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.intValue(int64(uint32(left) >> (uint32(right) & 0x1F)))
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toNumeric(vm.stack[vm.sp-2])
 	right := toNumeric(vm.stack[vm.sp-1])
 
@@ -1814,7 +1952,7 @@ func (_shr) exec(vm *vm) {
 		panic(vm.r.NewTypeError("BigInts have no unsigned right shift, use >> instead"))
 	}
 
-	vm.stack[vm.sp-2] = intToValue(int64(toUint32(left) >> (toUint32(right) & 0x1F)))
+	vm.stack[vm.sp-2] = vm.intValue(int64(toUint32(left) >> (toUint32(right) & 0x1F)))
 	vm.sp--
 	vm.pc++
 }
@@ -1945,10 +2083,7 @@ func (_setElem1Named) exec(vm *vm) {
 	base := receiver.ToObject(vm.r)
 	propName := vm.stack[vm.sp-2]
 	val := vm.stack[vm.sp-1]
-	vm.r.toObject(val).self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        funcName("", propName),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(vm.r.toObject(val), funcName("", propName))
 	base.set(propName, val, receiver, true)
 
 	vm.sp -= 2
@@ -1963,10 +2098,7 @@ func (d *defineMethod) exec(vm *vm) {
 	obj := vm.r.toObject(vm.stack[vm.sp-3])
 	propName := vm.stack[vm.sp-2]
 	method := vm.r.toObject(vm.stack[vm.sp-1])
-	method.self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        funcName("", propName),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(method, funcName("", propName))
 	obj.defineOwnProperty(propName, PropertyDescriptor{
 		Value:        method,
 		Writable:     FLAG_TRUE,
@@ -2212,38 +2344,77 @@ func (p getPropRefRecvStrict) exec(vm *vm) {
 	vm.pc++
 }
 
-type setProp unistring.String
+// namedProp 是按名称读写属性的指令操作数与该位置的属性缓存，宿主与共享程序中 cache 为 nil，缓存按位置序号 site 存在执行它的 agent 中
+type namedProp struct {
+	name  unistring.String
+	cache *propCache
+	site  int32
+}
+
+// newNamedProp 返回属性名操作数，宿主与共享程序中分配位置序号，其余程序带新缓存
+func (c *compiler) newNamedProp(name unistring.String) namedProp {
+	if c.host || c.shared {
+		return namedProp{name: name, site: sharedPropSites.Add(1) - 1}
+	}
+	return namedProp{name: name, cache: new(propCache)}
+}
+
+// propCache 返回该位置在当前 agent 中使用的属性缓存
+func (p namedProp) propCache(vm *vm) *propCache {
+	if p.cache != nil {
+		return p.cache
+	}
+	return vm.r.agent.sharedPropCache(p.site)
+}
+
+// setSloppy 按非严格模式把 val 写入 receiver 的属性
+func (p namedProp) setSloppy(vm *vm, receiver, val Value) {
+	cache := p.propCache(vm)
+	if obj, ok := receiver.(*Object); ok && cache.set(obj, val) {
+		return
+	}
+	obj := receiver.ToObject(vm.r)
+	obj.self.setOwnStr(p.name, val, false)
+	cache.attachSet(obj, p.name)
+}
+
+// setStrict 按严格模式把 val 写入 receiver 的属性
+func (p namedProp) setStrict(vm *vm, receiver, val Value) {
+	if receiverObj, ok := receiver.(*Object); ok {
+		cache := p.propCache(vm)
+		if !cache.set(receiverObj, val) {
+			receiverObj.self.setOwnStr(p.name, val, true)
+			cache.attachSet(receiverObj, p.name)
+		}
+	} else {
+		base := receiver.ToObject(vm.r)
+		base.setStr(p.name, val, receiver, true)
+	}
+}
+
+type setProp struct{ namedProp }
 
 func (p setProp) exec(vm *vm) {
 	val := vm.stack[vm.sp-1]
-	vm.stack[vm.sp-2].ToObject(vm.r).self.setOwnStr(unistring.String(p), val, false)
+	p.setSloppy(vm, vm.stack[vm.sp-2], val)
 	vm.stack[vm.sp-2] = val
 	vm.sp--
 	vm.pc++
 }
 
-type setPropP unistring.String
+type setPropP struct{ namedProp }
 
 func (p setPropP) exec(vm *vm) {
-	val := vm.stack[vm.sp-1]
-	vm.stack[vm.sp-2].ToObject(vm.r).self.setOwnStr(unistring.String(p), val, false)
+	p.setSloppy(vm, vm.stack[vm.sp-2], vm.stack[vm.sp-1])
 	vm.sp -= 2
 	vm.pc++
 }
 
-type setPropStrict unistring.String
+type setPropStrict struct{ namedProp }
 
 func (p setPropStrict) exec(vm *vm) {
-	receiver := vm.stack[vm.sp-2]
 	val := vm.stack[vm.sp-1]
-	propName := unistring.String(p)
-	if receiverObj, ok := receiver.(*Object); ok {
-		receiverObj.self.setOwnStr(propName, val, true)
-	} else {
-		base := receiver.ToObject(vm.r)
-		base.setStr(propName, val, receiver, true)
-	}
-
+	p.setStrict(vm, vm.stack[vm.sp-2], val)
 	vm.stack[vm.sp-2] = val
 	vm.sp--
 	vm.pc++
@@ -2323,19 +2494,10 @@ func (p setPropRecvStrictP) exec(vm *vm) {
 	vm.pc++
 }
 
-type setPropStrictP unistring.String
+type setPropStrictP struct{ namedProp }
 
 func (p setPropStrictP) exec(vm *vm) {
-	receiver := vm.stack[vm.sp-2]
-	val := vm.stack[vm.sp-1]
-	propName := unistring.String(p)
-	if receiverObj, ok := receiver.(*Object); ok {
-		receiverObj.self.setOwnStr(propName, val, true)
-	} else {
-		base := receiver.ToObject(vm.r)
-		base.setStr(propName, val, receiver, true)
-	}
-
+	p.setStrict(vm, vm.stack[vm.sp-2], vm.stack[vm.sp-1])
 	vm.sp -= 2
 	vm.pc++
 }
@@ -2418,10 +2580,7 @@ func (s *defineGetterKeyed) exec(vm *vm) {
 	obj := vm.r.toObject(vm.stack[vm.sp-2])
 	val := vm.stack[vm.sp-1]
 	method := vm.r.toObject(val)
-	method.self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        asciiString("get ").Concat(stringValueFromRaw(s.key)),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(method, asciiString("get ").Concat(stringValueFromRaw(s.key)))
 	descr := PropertyDescriptor{
 		Getter:       val,
 		Configurable: FLAG_TRUE,
@@ -2443,10 +2602,7 @@ func (s *defineSetterKeyed) exec(vm *vm) {
 	obj := vm.r.toObject(vm.stack[vm.sp-2])
 	val := vm.stack[vm.sp-1]
 	method := vm.r.toObject(val)
-	method.self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        asciiString("set ").Concat(stringValueFromRaw(s.key)),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(method, asciiString("set ").Concat(stringValueFromRaw(s.key)))
 
 	descr := PropertyDescriptor{
 		Setter:       val,
@@ -2469,10 +2625,7 @@ func (s *defineGetter) exec(vm *vm) {
 	propName := vm.stack[vm.sp-2]
 	val := vm.stack[vm.sp-1]
 	method := vm.r.toObject(val)
-	method.self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        funcName("get ", propName),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(method, funcName("get ", propName))
 
 	descr := PropertyDescriptor{
 		Getter:       val,
@@ -2496,10 +2649,7 @@ func (s *defineSetter) exec(vm *vm) {
 	val := vm.stack[vm.sp-1]
 	method := vm.r.toObject(val)
 
-	method.self.defineOwnPropertyStr("name", PropertyDescriptor{
-		Value:        funcName("set ", propName),
-		Configurable: FLAG_TRUE,
-	}, true)
+	setFunctionName(method, funcName("set ", propName))
 
 	descr := PropertyDescriptor{
 		Setter:       val,
@@ -2515,7 +2665,7 @@ func (s *defineSetter) exec(vm *vm) {
 
 // baseSource 返回属性访问报错中的基址表达式，Ion 代码在触发编译前出过错的位置报错时为空
 func (vm *vm) baseSource(source string) string {
-	if !vm.prg.host && vm.prg.failAccess(vm.pc) {
+	if !vm.prg.host && !vm.prg.shared && vm.prg.failAccess(vm.pc) {
 		return ""
 	}
 	return source
@@ -2525,8 +2675,58 @@ func (vm *vm) baseSource(source string) string {
 type loopHead struct{}
 
 func (loopHead) exec(vm *vm) {
-	vm.prg.countWarmUp()
+	p := vm.prg
+	p.countWarmUp()
+	if !p.host && p.warmUp >= baselineInterpreterWarmUpThreshold {
+		p.baseline = true
+	}
 	vm.pc++
+}
+
+// functionPropertyIC 按 SpiderMonkey 基线内联缓存的 GetProp.FunctionName 与 GetProp.FunctionLength 存根读取尚未定义的 JS 函数 name 或 length 而不定义属性；未附加存根时按 tryAttachFunction 与 ICState 尝试附加并返回 nil，由常规读取定义属性
+func (vm *vm) functionPropertyIC(obj *Object, name unistring.String) Value {
+	p := vm.prg
+	if !p.baseline {
+		return nil
+	}
+	fn, ok := obj.self.(interface{ jsFunc() *baseJsFuncObject })
+	if !ok {
+		return nil
+	}
+	f := fn.jsFunc()
+	length := name == "length"
+	if length && f.lazy&lazyLengthProp == 0 || !length && f.lazy&lazyNameProp == 0 {
+		return nil
+	}
+	ic := p.functionICs[vm.pc]
+	if ic == nil {
+		if p.functionICs == nil {
+			p.functionICs = make(map[int]*functionIC)
+		}
+		ic = &functionIC{}
+		p.functionICs[vm.pc] = ic
+	}
+	if ic.attached {
+		if length {
+			return f.lenProp.value
+		}
+		return stringValueFromRaw(f.lazyName)
+	}
+	if ic.generic {
+		return nil
+	}
+	if ic.failures >= 5+40*ic.stubs {
+		ic.generic = true
+		return nil
+	}
+	if length && (f.prg == nil || f.prg.lazy && f.prg.entries == 0) {
+		ic.failures++
+		return nil
+	}
+	ic.attached = true
+	ic.stubs++
+	ic.failures = min(ic.failures, 1)
+	return nil
 }
 
 // propertyAccessError 返回 SpiderMonkey 访问 undefined 或 null 基址属性时的 TypeError，baseSource 为可反编译的基址表达式
@@ -2639,24 +2839,60 @@ func (g getProp) exec(vm *vm) {
 		vm.throw(vm.r.propertyAccessError(spiderMonkeyQuote(stringValueFromRaw(unistring.String(g))), "", v))
 		return
 	}
+	if g == "name" || g == "length" {
+		if value := vm.functionPropertyIC(obj, unistring.String(g)); value != nil {
+			vm.stack[vm.sp-1] = value
+			vm.pc++
+			return
+		}
+	}
 	vm.stack[vm.sp-1] = nilSafe(obj.self.getStr(unistring.String(g), v))
 
 	vm.pc++
 }
 
 type getPropSource struct {
-	name       unistring.String
+	namedProp
 	baseSource string
 }
 
 func (g getPropSource) exec(vm *vm) {
 	v := vm.stack[vm.sp-1]
-	obj := vm.r.primitiveBase(v)
-	if obj == nil {
-		vm.throw(vm.r.propertyAccessError(spiderMonkeyQuote(stringValueFromRaw(g.name)), vm.baseSource(g.baseSource), v))
+	obj, ok := v.(*Object)
+	if !ok {
+		if obj = vm.r.primitiveBase(v); obj == nil {
+			vm.throw(vm.r.propertyAccessError(spiderMonkeyQuote(stringValueFromRaw(g.name)), vm.baseSource(g.baseSource), v))
+			return
+		}
+	}
+	cache := g.propCache(vm)
+	if value := cache.lookup(obj); value != nil {
+		if prop, ok := value.(*valueProperty); ok {
+			if prop.getterFunc != nil {
+				vm.push(prop.getterFunc)
+				prop.getterFunc.self.vmCall(vm, 0)
+				return
+			}
+			value = prop.get(v)
+		}
+		vm.stack[vm.sp-1] = value
+		vm.pc++
 		return
 	}
+	if g.name == "name" || g.name == "length" {
+		if a, ok := obj.self.(*arrayObject); ok && g.name == "length" {
+			vm.stack[vm.sp-1] = vm.intValue(int64(a.length))
+			vm.pc++
+			return
+		}
+		if value := vm.functionPropertyIC(obj, g.name); value != nil {
+			vm.stack[vm.sp-1] = value
+			vm.pc++
+			return
+		}
+	}
 	vm.stack[vm.sp-1] = nilSafe(obj.self.getStr(g.name, v))
+	cache.attachGet(obj, g.name, true)
 	vm.pc++
 }
 
@@ -2696,19 +2932,27 @@ func (g getPropRecvCallee) exec(vm *vm) {
 	vm.pc++
 }
 
-type getPropCallee unistring.String
+type getPropCallee struct{ namedProp }
 
 func (g getPropCallee) exec(vm *vm) {
 	v := vm.stack[vm.sp-1]
-	obj := vm.r.primitiveBase(v)
-	n := unistring.String(g)
-	if obj == nil {
-		vm.throw(vm.r.propertyAccessError(spiderMonkeyQuote(stringValueFromRaw(n)), "", v))
-		return
+	obj, ok := v.(*Object)
+	if !ok {
+		if obj = vm.r.primitiveBase(v); obj == nil {
+			vm.throw(vm.r.propertyAccessError(spiderMonkeyQuote(stringValueFromRaw(g.name)), "", v))
+			return
+		}
 	}
-	prop := obj.self.getStr(n, v)
-	if prop == nil {
-		prop = memberUnresolved{valueUnresolved{r: vm.r, ref: n}}
+	cache := g.propCache(vm)
+	prop := cache.lookup(obj)
+	if p, ok := prop.(*valueProperty); ok {
+		prop = p.get(v)
+	} else if prop == nil {
+		if prop = obj.self.getStr(g.name, v); prop == nil {
+			prop = memberUnresolved{valueUnresolved{r: vm.r, ref: g.name}}
+		} else {
+			cache.attachGet(obj, g.name, false)
+		}
 	}
 	vm.push(prop)
 
@@ -3577,17 +3821,54 @@ func (_initValueP) exec(vm *vm) {
 	vm.pc++
 }
 
+// dynName 是按名称查找变量的指令操作数与该位置的作用域缓存
+type dynName struct {
+	name  unistring.String
+	cache *dynCache
+}
+
+// newDynName 返回带新缓存的变量名操作数
+func newDynName(name unistring.String) dynName {
+	return dynName{name: name, cache: new(dynCache)}
+}
+
+// lookup 沿作用域链查找变量，找到时返回值与所在作用域，在作用域链上找不到时返回 nil
+func (n dynName) lookup(vm *vm) (Value, *stash) {
+	if st, idx, hit := n.cache.find(vm); hit {
+		if st == nil {
+			return nil, nil
+		}
+		v := st.values[idx&^maskTyp]
+		if v == nil {
+			if idx&maskVar == 0 {
+				panic(errAccessBeforeInit)
+			}
+			v = _undefined
+		}
+		return v, st
+	}
+	v, st, depth := vm.findDynamic(n.name)
+	n.cache.attach(vm, st, depth, n.name)
+	return v, st
+}
+
+// findDynamic 沿作用域链查找变量，返回值、所在作用域与它自当前作用域起的层数，找不到时返回的层数为作用域链的长度
+func (vm *vm) findDynamic(name unistring.String) (Value, *stash, int) {
+	depth := 0
+	for stash := vm.stash; stash != nil; stash = stash.outer {
+		if v, exists := stash.getByName(name); exists {
+			return v, stash, depth
+		}
+		depth++
+	}
+	return nil, nil, depth
+}
+
 type loadDynamic unistring.String
 
 func (n loadDynamic) exec(vm *vm) {
 	name := unistring.String(n)
-	var val Value
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if v, exists := stash.getByName(name); exists {
-			val = v
-			break
-		}
-	}
+	val, _, _ := vm.findDynamic(name)
 	if val == nil {
 		val = vm.r.globalObject.self.getStr(name, nil)
 		if val == nil {
@@ -3599,17 +3880,28 @@ func (n loadDynamic) exec(vm *vm) {
 	vm.pc++
 }
 
-type loadDynamicRef unistring.String
+// loadDynamicCached 是带作用域缓存的 loadDynamic
+type loadDynamicCached struct{ dynName }
 
-func (n loadDynamicRef) exec(vm *vm) {
-	name := unistring.String(n)
-	var val Value
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if v, exists := stash.getByName(name); exists {
-			val = v
-			break
+func (n loadDynamicCached) exec(vm *vm) {
+	name := n.name
+	val, _ := n.lookup(vm)
+	if val == nil {
+		val = vm.r.globalObject.self.getStr(name, nil)
+		if val == nil {
+			vm.throw(vm.r.newReferenceError(name))
+			return
 		}
 	}
+	vm.push(val)
+	vm.pc++
+}
+
+type loadDynamicRef struct{ dynName }
+
+func (n loadDynamicRef) exec(vm *vm) {
+	name := n.name
+	val, _ := n.lookup(vm)
 	if val == nil {
 		val = vm.r.globalObject.self.getStr(name, nil)
 		if val == nil {
@@ -3620,18 +3912,14 @@ func (n loadDynamicRef) exec(vm *vm) {
 	vm.pc++
 }
 
-type loadDynamicCallee unistring.String
+type loadDynamicCallee struct{ dynName }
 
 func (n loadDynamicCallee) exec(vm *vm) {
-	name := unistring.String(n)
-	var val Value
+	name := n.name
 	var callee *Object
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if v, exists := stash.getByName(name); exists {
-			callee = stash.obj
-			val = v
-			break
-		}
+	val, stash := n.lookup(vm)
+	if stash != nil {
+		callee = stash.obj
 	}
 	if val == nil {
 		val = vm.r.globalObject.self.getStr(name, nil)
@@ -3795,6 +4083,7 @@ func (e *enterBlock) exec(vm *vm) {
 		vm.stash.values = make([]Value, e.stashSize)
 		if len(e.names) > 0 {
 			vm.stash.names = e.names
+			vm.stash.scope = &e.names
 		}
 	}
 	ss := int(e.stackSize)
@@ -3818,6 +4107,7 @@ func (e *enterCatchBlock) exec(vm *vm) {
 	vm.stash.values = make([]Value, e.stashSize)
 	if len(e.names) > 0 {
 		vm.stash.names = e.names
+		vm.stash.scope = &e.names
 	}
 	vm.sp--
 	vm.stash.values[0] = vm.stack[vm.sp]
@@ -3887,6 +4177,7 @@ func (e *enterFunc) exec(vm *vm) {
 		} else {
 			stash.names = e.names
 		}
+		stash.scope = &e.names
 	}
 
 	ss := int(e.stackSize)
@@ -3956,6 +4247,7 @@ func (e *enterFunc1) exec(vm *vm) {
 		} else {
 			stash.names = e.names
 		}
+		stash.scope = &e.names
 	}
 	offset := vm.args - int(e.argsToCopy)
 	if offset > 0 {
@@ -4003,6 +4295,7 @@ func (e *enterFuncBody) exec(vm *vm) {
 			} else {
 				stash.names = e.names
 			}
+			stash.scope = &e.names
 		}
 	}
 	sp := vm.sp
@@ -4093,7 +4386,7 @@ type newFunc struct {
 }
 
 func (n *newFunc) exec(vm *vm) {
-	obj := vm.r.newFunc(n.name, n.length, n.strict)
+	obj := vm.r.newFunc(n.name, n.length, n.strict, n.prg.host)
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
@@ -4111,7 +4404,7 @@ type newAsyncFunc struct {
 }
 
 func (n *newAsyncFunc) exec(vm *vm) {
-	obj := vm.r.newAsyncFunc(n.name, n.length, n.strict)
+	obj := vm.r.newAsyncFunc(n.name, n.length, n.strict, n.prg.host)
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
@@ -4125,7 +4418,7 @@ type newGeneratorFunc struct {
 }
 
 func (n *newGeneratorFunc) exec(vm *vm) {
-	obj := vm.r.newGeneratorFunc(n.name, n.length, n.strict)
+	obj := vm.r.newGeneratorFunc(n.name, n.length, n.strict, n.prg.host)
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
@@ -4152,7 +4445,7 @@ func (n *newMethod) _exec(vm *vm, obj *methodFuncObject) {
 }
 
 func (n *newMethod) exec(vm *vm) {
-	n._exec(vm, vm.r.newMethod(n.name, n.length, n.strict))
+	n._exec(vm, vm.r.newMethod(n.name, n.length, n.strict, n.prg.host))
 }
 
 type newAsyncMethod struct {
@@ -4160,7 +4453,7 @@ type newAsyncMethod struct {
 }
 
 func (n *newAsyncMethod) exec(vm *vm) {
-	obj := vm.r.newAsyncMethod(n.name, n.length, n.strict)
+	obj := vm.r.newAsyncMethod(n.name, n.length, n.strict, n.prg.host)
 	n._exec(vm, &obj.methodFuncObject)
 }
 
@@ -4169,7 +4462,7 @@ type newGeneratorMethod struct {
 }
 
 func (n *newGeneratorMethod) exec(vm *vm) {
-	obj := vm.r.newGeneratorMethod(n.name, n.length, n.strict)
+	obj := vm.r.newGeneratorMethod(n.name, n.length, n.strict, n.prg.host)
 	n._exec(vm, &obj.methodFuncObject)
 }
 
@@ -4229,11 +4522,11 @@ func (n *newArrowFunc) _exec(vm *vm, obj *arrowFuncObject) {
 }
 
 func (n *newArrowFunc) exec(vm *vm) {
-	n._exec(vm, vm.r.newArrowFunc(n.name, n.length, n.strict))
+	n._exec(vm, vm.r.newArrowFunc(n.name, n.length, n.strict, n.prg.host))
 }
 
 func (n *newAsyncArrowFunc) exec(vm *vm) {
-	obj := vm.r.newAsyncArrowFunc(n.name, n.length, n.strict)
+	obj := vm.r.newAsyncArrowFunc(n.name, n.length, n.strict, n.prg.host)
 	n._exec(vm, &obj.arrowFuncObject)
 }
 
@@ -4433,7 +4726,7 @@ type jneP int32
 
 func (j jneP) exec(vm *vm) {
 	vm.sp--
-	if !vm.stack[vm.sp].ToBoolean() {
+	if !truthy(vm.stack[vm.sp]) {
 		vm.pc += int(j)
 	} else {
 		vm.pc++
@@ -4444,7 +4737,7 @@ type jeqP int32
 
 func (j jeqP) exec(vm *vm) {
 	vm.sp--
-	if vm.stack[vm.sp].ToBoolean() {
+	if truthy(vm.stack[vm.sp]) {
 		vm.pc += int(j)
 	} else {
 		vm.pc++
@@ -4454,7 +4747,7 @@ func (j jeqP) exec(vm *vm) {
 type jeq int32
 
 func (j jeq) exec(vm *vm) {
-	if vm.stack[vm.sp-1].ToBoolean() {
+	if truthy(vm.stack[vm.sp-1]) {
 		vm.pc += int(j)
 	} else {
 		vm.sp--
@@ -4465,7 +4758,7 @@ func (j jeq) exec(vm *vm) {
 type jne int32
 
 func (j jne) exec(vm *vm) {
-	if !vm.stack[vm.sp-1].ToBoolean() {
+	if !truthy(vm.stack[vm.sp-1]) {
 		vm.pc += int(j)
 	} else {
 		vm.sp--
@@ -4600,7 +4893,7 @@ type _not struct{}
 var not _not
 
 func (_not) exec(vm *vm) {
-	if vm.stack[vm.sp-1].ToBoolean() {
+	if truthy(vm.stack[vm.sp-1]) {
 		vm.stack[vm.sp-1] = valueFalse
 	} else {
 		vm.stack[vm.sp-1] = valueTrue
@@ -4725,6 +5018,12 @@ type _op_lt struct{}
 var op_lt _op_lt
 
 func (_op_lt) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left < right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toPrimitiveNumber(vm.stack[vm.sp-2])
 	right := toPrimitiveNumber(vm.stack[vm.sp-1])
 
@@ -4743,6 +5042,12 @@ type _op_lte struct{}
 var op_lte _op_lte
 
 func (_op_lte) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left <= right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toPrimitiveNumber(vm.stack[vm.sp-2])
 	right := toPrimitiveNumber(vm.stack[vm.sp-1])
 
@@ -4762,6 +5067,12 @@ type _op_gt struct{}
 var op_gt _op_gt
 
 func (_op_gt) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left > right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toPrimitiveNumber(vm.stack[vm.sp-2])
 	right := toPrimitiveNumber(vm.stack[vm.sp-1])
 
@@ -4780,6 +5091,12 @@ type _op_gte struct{}
 var op_gte _op_gte
 
 func (_op_gte) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left >= right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	left := toPrimitiveNumber(vm.stack[vm.sp-2])
 	right := toPrimitiveNumber(vm.stack[vm.sp-1])
 
@@ -4799,6 +5116,12 @@ type _op_eq struct{}
 var op_eq _op_eq
 
 func (_op_eq) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left == right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	if vm.stack[vm.sp-2].Equals(vm.stack[vm.sp-1]) {
 		vm.stack[vm.sp-2] = valueTrue
 	} else {
@@ -4813,6 +5136,12 @@ type _op_neq struct{}
 var op_neq _op_neq
 
 func (_op_neq) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left != right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	if vm.stack[vm.sp-2].Equals(vm.stack[vm.sp-1]) {
 		vm.stack[vm.sp-2] = valueFalse
 	} else {
@@ -4827,6 +5156,12 @@ type _op_strict_eq struct{}
 var op_strict_eq _op_strict_eq
 
 func (_op_strict_eq) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left == right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	if vm.stack[vm.sp-2].StrictEquals(vm.stack[vm.sp-1]) {
 		vm.stack[vm.sp-2] = valueTrue
 	} else {
@@ -4841,6 +5176,12 @@ type _op_strict_neq struct{}
 var op_strict_neq _op_strict_neq
 
 func (_op_strict_neq) exec(vm *vm) {
+	if left, right, ok := vm.intOperands(); ok {
+		vm.stack[vm.sp-2] = vm.r.toBoolean(left != right)
+		vm.sp--
+		vm.pc++
+		return
+	}
 	if vm.stack[vm.sp-2].StrictEquals(vm.stack[vm.sp-1]) {
 		vm.stack[vm.sp-2] = valueFalse
 	} else {
@@ -5020,7 +5361,7 @@ type _new uint32
 func (n _new) exec(vm *vm) {
 	sp := vm.sp - int(n)
 	obj := vm.stack[sp-1]
-	ctor := vm.r.toConstructor(obj)
+	ctor := vm.newCallee(obj)
 	vm.stack[sp-1] = ctor(vm.stack[sp:vm.sp], nil)
 	vm.sp = sp
 	vm.pc++
@@ -5403,6 +5744,7 @@ func (copyStash) exec(vm *vm) {
 	vm.stashAllocs++
 	newStash.values = append([]Value(nil), oldStash.values...)
 	newStash.names = oldStash.names
+	newStash.scope = oldStash.scope
 	vm.stash = newStash
 	vm.pc++
 }
@@ -5648,7 +5990,7 @@ func (vm *vm) fillPrivateNamesMap(typ *privateEnvType, privateFields, privateMet
 
 func (c *newClass) create(protoParent, ctorParent *Object, vm *vm, derived bool) (prototype, cls *Object) {
 	proto := vm.r.newBaseObject(protoParent, classObject)
-	f := vm.r.newClassFunc(c.name, c.length, ctorParent, derived)
+	f := vm.r.newClassFunc(c.name, c.length, ctorParent, derived, vm.prg.host)
 	f._putProp("prototype", proto.val, false, false, false)
 	proto._putProp("constructor", f.val, true, false, true)
 	f.prg = c.ctor
@@ -5681,16 +6023,19 @@ func (c *newDerivedClass) exec(vm *vm) {
 	var protoParent *Object
 	var superClass *Object
 	if o := vm.stack[vm.sp-1]; o != _null {
-		if sc, ok := o.(*Object); !ok || sc.self.assertConstructor() == nil {
-			vm.throw(vm.r.NewTypeError("Class extends value is not a constructor or null"))
+		if sc, ok := o.(*Object); !ok {
+			vm.throw(vm.r.NewTypeError("class heritage %s is not an object or null", vm.calleeText(o)))
+			return
+		} else if sc.self.assertConstructor() == nil {
+			vm.throw(vm.r.NewTypeError("%s is not a constructor", vm.calleeText(o)))
 			return
 		} else {
-			v := sc.self.getStr("prototype", nil)
+			v := nilSafe(sc.self.getStr("prototype", nil))
 			if v != _null {
 				if o, ok := v.(*Object); ok {
 					protoParent = o
 				} else {
-					vm.throw(vm.r.NewTypeError("Class extends value does not have valid prototype property"))
+					vm.throw(vm.r.NewTypeError("%s is not an object or null", valueSource(v)))
 					return
 				}
 			}
@@ -5714,7 +6059,7 @@ type newStaticFieldInit struct {
 }
 
 func (c *newStaticFieldInit) exec(vm *vm) {
-	f := vm.r.newClassFunc("", 0, vm.r.getFunctionPrototype(), false)
+	f := vm.r.newClassFunc("", 0, vm.r.getFunctionPrototype(), false, true)
 	if c.numPrivateFields > 0 || c.numPrivateMethods > 0 {
 		vm.createPrivateType(f, c.numPrivateFields, c.numPrivateMethods)
 	}
@@ -6221,4 +6566,15 @@ func (y *yieldMarker) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// setFunctionName 设置方法、访问器与计算键函数的 name：JS 函数的 name 尚未定义时只更新定义值，与 SpiderMonkey 的 SetFunctionName 一致
+func setFunctionName(fn *Object, name String) {
+	if f, ok := fn.self.(interface{ jsFunc() *baseJsFuncObject }); ok && f.jsFunc().setLazyName(name) {
+		return
+	}
+	fn.self.defineOwnPropertyStr("name", PropertyDescriptor{
+		Value:        name,
+		Configurable: FLAG_TRUE,
+	}, true)
 }

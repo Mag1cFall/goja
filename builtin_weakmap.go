@@ -39,6 +39,14 @@ func (wm *weakMap) get(key *Object) (res Value) {
 	return
 }
 
+// WeakMapGet 返回 WeakMap 对象中键 key 对应的值，对象不是 WeakMap 或没有该键时返回 nil
+func (o *Object) WeakMapGet(key *Object) Value {
+	if wmo, ok := o.self.(*weakMapObject); ok {
+		return wmo.m.get(key)
+	}
+	return nil
+}
+
 func (wm *weakMap) remove(key *Object) (removed bool) {
 	p := weak.Make(key)
 	wm.Lock()

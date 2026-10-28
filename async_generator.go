@@ -125,26 +125,30 @@ func (f *asyncGeneratorMethodFuncObject) export(*objectExportCtx) interface{} {
 }
 
 // newAsyncGeneratorFunc 创建异步生成器函数及其 prototype 对象
-func (r *Runtime) newAsyncGeneratorFunc(name unistring.String, length int, strict bool) (f *asyncGeneratorFuncObject) {
+func (r *Runtime) newAsyncGeneratorFunc(name unistring.String, length int, strict, host bool) (f *asyncGeneratorFuncObject) {
 	f = &asyncGeneratorFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.prototype = r.getAsyncGeneratorFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
-	f._putProp("prototype", r.newBaseObject(r.getAsyncGeneratorPrototype(), classObject).val, true, false, false)
-	f.orderOwnKeys("prototype")
+	f.initJs(name, length, host, true)
+	if host {
+		f._putProp("prototype", r.newBaseObject(r.getAsyncGeneratorPrototype(), classObject).val, true, false, false)
+		f.orderOwnKeys("prototype")
+	}
 	return
 }
 
 // newAsyncGeneratorMethod 创建异步生成器方法及其 prototype 对象
-func (r *Runtime) newAsyncGeneratorMethod(name unistring.String, length int, strict bool) (f *asyncGeneratorMethodFuncObject) {
+func (r *Runtime) newAsyncGeneratorMethod(name unistring.String, length int, strict, host bool) (f *asyncGeneratorMethodFuncObject) {
 	f = &asyncGeneratorMethodFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.prototype = r.getAsyncGeneratorFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
-	f._putProp("prototype", r.newBaseObject(r.getAsyncGeneratorPrototype(), classObject).val, true, false, false)
-	f.orderOwnKeys("prototype")
+	f.initJs(name, length, host, true)
+	if host {
+		f._putProp("prototype", r.newBaseObject(r.getAsyncGeneratorPrototype(), classObject).val, true, false, false)
+		f.orderOwnKeys("prototype")
+	}
 	return
 }
 
@@ -154,7 +158,7 @@ type newAsyncGeneratorFunc struct {
 }
 
 func (n *newAsyncGeneratorFunc) exec(vm *vm) {
-	obj := vm.r.newAsyncGeneratorFunc(n.name, n.length, n.strict)
+	obj := vm.r.newAsyncGeneratorFunc(n.name, n.length, n.strict, n.prg.host)
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
@@ -169,7 +173,7 @@ type newAsyncGeneratorMethod struct {
 }
 
 func (n *newAsyncGeneratorMethod) exec(vm *vm) {
-	obj := vm.r.newAsyncGeneratorMethod(n.name, n.length, n.strict)
+	obj := vm.r.newAsyncGeneratorMethod(n.name, n.length, n.strict, n.prg.host)
 	n._exec(vm, &obj.methodFuncObject)
 }
 

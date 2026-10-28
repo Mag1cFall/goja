@@ -47,6 +47,7 @@ type (
 
 	Binding struct {
 		Target      BindingTarget
+		Assign      file.Idx
 		Initializer Expression
 	}
 
@@ -224,10 +225,11 @@ type (
 	}
 
 	ParameterList struct {
-		Opening file.Idx
-		List    []*Binding
-		Rest    Expression
-		Closing file.Idx
+		Opening  file.Idx
+		List     []*Binding
+		Ellipsis file.Idx
+		Rest     Expression
+		Closing  file.Idx
 	}
 
 	Property interface {

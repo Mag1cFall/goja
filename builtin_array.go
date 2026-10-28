@@ -111,6 +111,12 @@ func (r *Runtime) generic_push(obj *Object, call FunctionCall) Value {
 
 func (r *Runtime) arrayproto_push(call FunctionCall) Value {
 	obj := call.This.ToObject(r)
+	if a, ok := obj.self.(*arrayObject); ok && a.appendable(len(call.Arguments)) {
+		a.values = append(a.values, call.Arguments...)
+		a.length += uint32(len(call.Arguments))
+		a.objCount += len(call.Arguments)
+		return intToValue(int64(a.length))
+	}
 	return r.generic_push(obj, call)
 }
 
@@ -1437,11 +1443,8 @@ func (r *Runtime) checkStdArrayObj(obj *Object) *arrayObject {
 func (r *Runtime) checkStdArrayObjWithProto(obj *Object) *arrayObject {
 	if arr := r.checkStdArrayObj(obj); arr != nil {
 		if p1, ok := arr.prototype.self.(*arrayObject); ok && p1.propValueCount == 0 {
-			if p2, ok := p1.prototype.self.(*baseObject); ok && p2.prototype == nil {
-				p2.ensurePropOrder()
-				if p2.idxPropCount == 0 {
-					return arr
-				}
+			if p2, ok := p1.prototype.self.(*baseObject); ok && p2.prototype == nil && !p2.hasIdxKeys() {
+				return arr
 			}
 		}
 	}

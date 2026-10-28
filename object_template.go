@@ -5,7 +5,6 @@ import (
 	"github.com/Mag1cFall/goja/unistring"
 	"math"
 	"reflect"
-	"sort"
 	"strings"
 )
 
@@ -142,6 +141,8 @@ func (r *Runtime) newTemplatedObject(tmpl *objectTemplate, obj *Object) *templat
 	}
 	obj.self = o
 	o.init()
+	obj.shape = r.templateShape(tmpl)
+	obj.slots = make([]Value, len(obj.shape.names))
 	return o
 }
 
@@ -171,15 +172,22 @@ func (o *templatedObject) getSym(s *Symbol, receiver Value) Value {
 }
 
 func (o *templatedObject) getOwnPropStr(p unistring.String) Value {
-	if v, exists := o.values[p]; exists {
+	i := o.ownIndex(p)
+	if i < 0 {
+		return nil
+	}
+	if v := o.val.slots[i]; v != nil {
 		return v
 	}
-	if f := o.tmpl.props[p]; f != nil {
-		v := f(o.val.runtime)
-		o.values[p] = v
-		return v
+	s := o.val.shape
+	v := o.tmpl.props[p](o.val.runtime)
+	if o.val.shape != s {
+		if i = o.ownIndex(p); i < 0 {
+			return v
+		}
 	}
-	return nil
+	o.val.slots[i] = v
+	return v
 }
 
 func (o *templatedObject) materialiseSymbols() {
@@ -199,17 +207,10 @@ func (o *templatedObject) getOwnPropSym(s *Symbol) Value {
 	return o.baseObject.getOwnPropSym(s)
 }
 
-func (o *templatedObject) materialisePropNames() {
-	if o.propNames == nil {
-		o.propNames = append(([]unistring.String)(nil), o.tmpl.propNames...)
-	}
-}
-
 func (o *templatedObject) setOwnStr(p unistring.String, v Value, throw bool) bool {
 	existing := o.getOwnPropStr(p) // materialise property (in case it's an accessor)
 	if existing == nil {
 		o.materialiseProto()
-		o.materialisePropNames()
 	}
 	return o.baseObject.setOwnStr(p, v, throw)
 }
@@ -243,7 +244,26 @@ func (o *templatedObject) setProto(proto *Object, throw bool) bool {
 }
 
 func (o *templatedObject) setForeignIdx(name valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if toIdx(name) != math.MaxUint32 && !o.hasIdxKeys() {
+		o.materialiseProto()
+		return o._setForeignIdx(name, nil, val, receiver, throw)
+	}
 	return o.setForeignStr(name.string(), val, receiver, throw)
+}
+
+// getIdx 在没有整数键时直接沿原型链按下标读取，属性读取有副作用的对象按字符串键读取
+func (o *templatedObject) getIdx(idx valueInt, receiver Value) Value {
+	if o.val.cacheKind() == kindNone || toIdx(idx) == math.MaxUint32 || o.hasIdxKeys() {
+		return o.baseObject.getIdx(idx, receiver)
+	}
+	o.materialiseProto()
+	if o.prototype == nil {
+		return nil
+	}
+	if receiver == nil {
+		receiver = o.val
+	}
+	return o.prototype.self.getIdx(idx, receiver)
 }
 
 func (o *templatedObject) setForeignSym(name *Symbol, val, receiver Value, throw bool) (bool, bool) {
@@ -275,12 +295,7 @@ func (o *templatedObject) hasPropertySym(s *Symbol) bool {
 }
 
 func (o *templatedObject) hasOwnPropertyStr(name unistring.String) bool {
-	if v, exists := o.values[name]; exists {
-		return v != nil
-	}
-
-	_, exists := o.tmpl.props[name]
-	return exists
+	return o.ownIndex(name) >= 0
 }
 
 func (o *templatedObject) hasOwnPropertySym(s *Symbol) bool {
@@ -294,12 +309,7 @@ func (o *templatedObject) hasOwnPropertySym(s *Symbol) bool {
 func (o *templatedObject) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
 	existingVal := o.getOwnPropStr(name)
 	if v, ok := o._defineOwnProperty(name, existingVal, descr, throw); ok {
-		o.values[name] = v
-		if existingVal == nil {
-			o.materialisePropNames()
-			names := copyNamesIfNeeded(o.propNames, 1)
-			o.propNames = append(names, name)
-		}
+		o._put(name, v)
 		return true
 	}
 	return false
@@ -315,11 +325,7 @@ func (o *templatedObject) deleteStr(name unistring.String, throw bool) bool {
 		if !o.checkDelete(name, val, throw) {
 			return false
 		}
-		o.materialisePropNames()
 		o._delete(name)
-		if _, exists := o.tmpl.props[name]; exists {
-			o.values[name] = nil // white hole
-		}
 	}
 	return true
 }
@@ -330,12 +336,9 @@ func (o *templatedObject) deleteSym(s *Symbol, throw bool) bool {
 }
 
 func (o *templatedObject) materialiseProps() {
-	for name, f := range o.tmpl.props {
-		if _, exists := o.values[name]; !exists {
-			o.values[name] = f(o.val.runtime)
-		}
+	for _, name := range o.val.shape.names {
+		o.getOwnPropStr(name)
 	}
-	o.materialisePropNames()
 }
 
 func (o *templatedObject) iterateStringKeys() iterNextFunc {
@@ -349,9 +352,7 @@ func (o *templatedObject) iterateSymbols() iterNextFunc {
 }
 
 func (o *templatedObject) stringKeys(all bool, keys []Value) []Value {
-	if all {
-		o.materialisePropNames()
-	} else {
+	if !all {
 		o.materialiseProps()
 	}
 	return o.baseObject.stringKeys(all, keys)
@@ -384,6 +385,8 @@ func (r *Runtime) newTemplatedFuncObject(tmpl *objectTemplate, obj *Object, f fu
 	}
 	obj.self = o
 	o.init()
+	obj.shape = r.templateShape(tmpl)
+	obj.slots = make([]Value, len(obj.shape.names))
 	return o
 }
 
@@ -441,6 +444,8 @@ func (r *Runtime) newTemplatedArrayObject(tmpl *objectTemplate, obj *Object) *te
 	}
 	obj.self = o
 	o.init()
+	obj.shape = r.templateShape(tmpl)
+	obj.slots = make([]Value, len(obj.shape.names))
 	return o
 }
 
@@ -471,15 +476,19 @@ func (a *templatedArrayObject) setLength(l uint32, throw bool) bool {
 		return false
 	}
 	ret := true
-	if l < oldLen {
-		a.materialisePropNames()
-		a.fixPropOrder()
-		i := sort.Search(a.idxPropCount, func(idx int) bool {
-			return strToArrayIdx(a.propNames[idx]) >= l
-		})
-		for j := a.idxPropCount - 1; j >= i; j-- {
-			if !a.deleteStr(a.propNames[j], false) {
-				l = strToArrayIdx(a.propNames[j]) + 1
+	if l < oldLen && a.hasIdxKeys() {
+		names := a.keyOrder()
+		k := 0
+		for k < len(names) && strToArrayIdx(names[k]) != math.MaxUint32 {
+			k++
+		}
+		for j := k - 1; j >= 0; j-- {
+			n := strToArrayIdx(names[j])
+			if n < l {
+				break
+			}
+			if !a.deleteStr(names[j], false) {
+				l = n + 1
 				ret = false
 				break
 			}

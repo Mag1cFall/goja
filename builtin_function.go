@@ -11,17 +11,12 @@ func (r *Runtime) functionCtor(args []Value, proto *Object, async, generator boo
 	}
 	var sb StringBuilder
 	if async {
-		if generator {
-			sb.WriteString(asciiString("(async function* anonymous("))
-		} else {
-			sb.WriteString(asciiString("(async function anonymous("))
-		}
+		sb.WriteString(asciiString("async "))
+	}
+	if generator {
+		sb.WriteString(asciiString("function* anonymous("))
 	} else {
-		if generator {
-			sb.WriteString(asciiString("(function* anonymous("))
-		} else {
-			sb.WriteString(asciiString("(function anonymous("))
-		}
+		sb.WriteString(asciiString("function anonymous("))
 	}
 	if len(args) > 1 {
 		ar := args[:len(args)-1]
@@ -32,13 +27,13 @@ func (r *Runtime) functionCtor(args []Value, proto *Object, async, generator boo
 			}
 		}
 	}
-	sb.WriteString(asciiString("\n) {\n"))
+	head := escapeInvalidUtf16(sb.String())
+	body := ""
 	if len(args) > 0 {
-		sb.WriteString(args[len(args)-1].toString())
+		body = escapeInvalidUtf16(args[len(args)-1].toString())
 	}
-	sb.WriteString(asciiString("\n})"))
 
-	ret := r.toObject(r.eval(sb.String(), false, false))
+	ret := r.toObject(r.evalFunction(head+"\n) {\n"+body+"\n}", len(head)+1))
 	ret.self.setProto(proto, true)
 	return ret
 }
@@ -169,9 +164,17 @@ func (r *Runtime) functionproto_bind(call FunctionCall) Value {
 	construct := obj.self.assertConstructor()
 
 	var l = _positiveZero
-	if obj.self.hasOwnPropertyStr("length") {
+	// 目标是 length、name 尚未定义的 JS 函数时直接取定义值，与 SpiderMonkey 的快速路径一样不定义目标的这两个属性
+	target, _ := obj.self.(interface{ jsFunc() *baseJsFuncObject })
+	var lenValue Value
+	if target != nil && target.jsFunc().lazy&lazyLengthProp != 0 {
+		lenValue = target.jsFunc().lenProp.value
+	} else if obj.self.hasOwnPropertyStr("length") {
+		lenValue = nilSafe(obj.self.getStr("length", nil))
+	}
+	if lenValue != nil {
 		var li int64
-		switch lenProp := nilSafe(obj.self.getStr("length", nil)).(type) {
+		switch lenProp := lenValue.(type) {
 		case valueInt:
 			li = lenProp.ToInteger()
 		case valueFloat:
@@ -198,7 +201,12 @@ func (r *Runtime) functionproto_bind(call FunctionCall) Value {
 		l = intToValue(li)
 	}
 lenNotInt:
-	name := obj.self.getStr("name", nil)
+	var name Value
+	if target != nil && target.jsFunc().lazy&lazyNameProp != 0 {
+		name = stringValueFromRaw(target.jsFunc().lazyName)
+	} else {
+		name = obj.self.getStr("name", nil)
+	}
 	nameStr := stringBound_
 	if s, ok := name.(String); ok {
 		nameStr = nameStr.Concat(s)

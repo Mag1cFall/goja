@@ -13,10 +13,15 @@ import (
 )
 
 func (self *_parser) parseBlockStatement() *ast.BlockStatement {
+	return self.parseBlockWith("missing } in compound statement")
+}
+
+// parseBlockWith 解析花括号语句块，缺少右花括号时报告 closing
+func (self *_parser) parseBlockWith(closing string) *ast.BlockStatement {
 	node := &ast.BlockStatement{}
 	node.LeftBrace = self.expect(token.LEFT_BRACE)
 	node.List = self.parseStatementList()
-	node.RightBrace = self.expect(token.RIGHT_BRACE)
+	node.RightBrace = self.expectWith(token.RIGHT_BRACE, closing)
 
 	return node
 }
@@ -38,7 +43,7 @@ func (self *_parser) parseStatementList() (list []ast.Statement) {
 func (self *_parser) parseStatement() ast.Statement {
 
 	if self.token == token.EOF {
-		self.errorUnexpectedToken(self.token)
+		self.errorExpectedExpression()
 		return &ast.BadStatement{From: self.idx, To: self.idx + 1}
 	}
 
@@ -164,9 +169,12 @@ func (self *_parser) parseTryStatement() ast.Statement {
 }
 
 func (self *_parser) parseFunctionParameterList() *ast.ParameterList {
-	opening := self.expect(token.LEFT_PARENTHESIS)
+	opening := self.expectWith(token.LEFT_PARENTHESIS, "missing ( before formal parameters")
+	end := self.opts.paramListEnd
+	self.opts.paramListEnd = 0
 	var list []*ast.Binding
 	var rest ast.Expression
+	var ellipsis file.Idx
 	if !self.scope.inFuncParams {
 		self.scope.inFuncParams = true
 		defer func() {
@@ -175,22 +183,27 @@ func (self *_parser) parseFunctionParameterList() *ast.ParameterList {
 	}
 	for self.token != token.RIGHT_PARENTHESIS && self.token != token.EOF {
 		if self.token == token.ELLIPSIS {
+			ellipsis = self.idx
 			self.next()
 			rest = self.reinterpretAsDestructBindingTarget(self.parseAssignmentExpression())
 			break
 		}
 		self.parseVariableDeclaration(&list)
 		if self.token != token.RIGHT_PARENTHESIS {
-			self.expect(token.COMMA)
+			self.expectWith(token.COMMA, "missing ) after formal parameters")
 		}
 	}
-	closing := self.expect(token.RIGHT_PARENTHESIS)
+	closing := self.expectWith(token.RIGHT_PARENTHESIS, "missing ) after formal parameters")
+	if end > 0 && int(closing)-self.base != end {
+		self.error(closing, "unexpected end of function parameter list")
+	}
 
 	return &ast.ParameterList{
-		Opening: opening,
-		List:    list,
-		Rest:    rest,
-		Closing: closing,
+		Opening:  opening,
+		List:     list,
+		Ellipsis: ellipsis,
+		Rest:     rest,
+		Closing:  closing,
 	}
 }
 
@@ -235,6 +248,9 @@ func (self *_parser) parseFunction(declaration, async bool, start file.Idx) *ast
 	var name *ast.Identifier
 	if self.token == token.IDENTIFIER {
 		name = self.parseIdentifier()
+	} else if self.token == token.YIELD || self.token == token.AWAIT {
+		self.error(self.idx, "%s is a reserved identifier", self.token.String())
+		self.next()
 	} else if declaration {
 		// Use expect error handling
 		self.expect(token.IDENTIFIER)
@@ -270,7 +286,7 @@ func (self *_parser) parseFunctionBlock(async, allowAwait, allowYield bool) (bod
 	self.scope.allowAwait = allowAwait
 	self.scope.allowYield = allowYield
 	defer self.closeScope()
-	body = self.parseBlockStatement()
+	body = self.parseBlockWith("missing } after function body")
 	declarationList = self.scope.declarationList
 	return
 }
@@ -278,6 +294,12 @@ func (self *_parser) parseFunctionBlock(async, allowAwait, allowYield bool) (bod
 func (self *_parser) parseArrowFunctionBody(async bool) (ast.ConciseBody, []*ast.VariableDeclaration) {
 	if self.token == token.LEFT_BRACE {
 		return self.parseFunctionBlock(async, async, false)
+	}
+	if self.scope.inFuncParams {
+		self.scope.inFuncParams = false
+		defer func() {
+			self.scope.inFuncParams = true
+		}()
 	}
 	if async != self.scope.inAsync || async != self.scope.allowAwait {
 		inAsync := self.scope.inAsync
@@ -385,7 +407,7 @@ func (self *_parser) parseClass(declaration bool) *ast.ClassLiteral {
 		_, private := value.(*ast.PrivateIdentifier)
 
 		if static && !private && keyName == "prototype" {
-			self.error(value.Idx0(), "Classes may not have a static property named 'prototype'")
+			self.error(methodBodyStart, "a class may not have a static property named 'prototype'")
 		}
 
 		if kind == "" && self.token == token.LEFT_PARENTHESIS {
@@ -394,18 +416,8 @@ func (self *_parser) parseClass(declaration bool) *ast.ClassLiteral {
 
 		if kind != "" {
 			// method
-			if keyName == "constructor" && !computed {
-				if !static {
-					if kind != ast.PropertyKindMethod {
-						self.error(value.Idx0(), "Class constructor may not be an accessor")
-					} else if async {
-						self.error(value.Idx0(), "Class constructor may not be an async method")
-					} else if generator {
-						self.error(value.Idx0(), "Class constructor may not be a generator")
-					}
-				} else if private {
-					self.error(value.Idx0(), "Class constructor may not be a private method")
-				}
+			if keyName == "constructor" && !computed && (private || !static && (kind != ast.PropertyKindMethod || async || generator)) {
+				self.error(methodBodyStart, "a class constructor definition must be a plain public method")
 			}
 			md := &ast.MethodDefinition{
 				Idx:      start,
@@ -425,7 +437,7 @@ func (self *_parser) parseClass(declaration bool) *ast.ClassLiteral {
 				}
 			}
 			if isCtor {
-				self.error(value.Idx0(), "Classes may not have a field named 'constructor'")
+				self.error(methodBodyStart, "a class constructor definition must be a plain public method")
 			}
 			var initializer ast.Expression
 			if self.token == token.ASSIGN {
@@ -447,7 +459,7 @@ func (self *_parser) parseClass(declaration bool) *ast.ClassLiteral {
 		}
 	}
 
-	node.RightBrace = self.expect(token.RIGHT_BRACE)
+	node.RightBrace = self.expectWith(token.RIGHT_BRACE, "expected property name, got "+self.describe(self.token))
 	node.Source = self.slice(node.Class, node.RightBrace+1)
 
 	return node
@@ -469,7 +481,7 @@ func (self *_parser) parseReturnStatement() ast.Statement {
 	idx := self.expect(token.RETURN)
 
 	if !self.scope.inFunction {
-		self.error(idx, "Illegal return statement")
+		self.error(idx, "return not in function")
 		self.nextStatement()
 		return &ast.BadStatement{From: idx, To: self.idx}
 	}
@@ -490,12 +502,13 @@ func (self *_parser) parseReturnStatement() ast.Statement {
 func (self *_parser) parseThrowStatement() ast.Statement {
 	idx := self.expect(token.THROW)
 
-	if self.implicitSemicolon {
-		if self.chr == -1 { // Hackish
-			self.error(idx, "Unexpected end of input")
-		} else {
-			self.error(idx, "Illegal newline after throw")
-		}
+	if self.implicitSemicolon && (self.token != token.EOF || strings.ContainsAny(self.str[int(idx)-self.base:], "\n\r\u2028\u2029")) {
+		self.error(idx, "no line break is allowed between 'throw' and its expression")
+		self.nextStatement()
+		return &ast.BadStatement{From: idx, To: self.idx}
+	}
+	if self.token == token.SEMICOLON || self.token == token.RIGHT_BRACE || self.token == token.EOF {
+		self.error(idx, "throw statement is missing an expression")
 		self.nextStatement()
 		return &ast.BadStatement{From: idx, To: self.idx}
 	}
@@ -795,10 +808,14 @@ func (self *_parser) parseForOrForInStatement() ast.Statement {
 }
 
 func (self *_parser) ensurePatternInit(list []*ast.Binding) {
-	for _, item := range list {
+	for i, item := range list {
 		if _, ok := item.Target.(ast.Pattern); ok {
 			if item.Initializer == nil {
-				self.error(item.Idx1(), "Missing initializer in destructuring declaration")
+				at := item.Idx1()
+				if i == len(list)-1 {
+					at = self.idx
+				}
+				self.error(at, "missing = in destructuring declaration")
 				break
 			}
 		}
@@ -853,9 +870,9 @@ func (self *_parser) parseDoWhileStatement() ast.Statement {
 	}
 
 	self.expect(token.WHILE)
-	self.expect(token.LEFT_PARENTHESIS)
+	self.expectWith(token.LEFT_PARENTHESIS, "missing ( before condition")
 	node.Test = self.parseExpression()
-	node.RightParenthesis = self.expect(token.RIGHT_PARENTHESIS)
+	node.RightParenthesis = self.expectWith(token.RIGHT_PARENTHESIS, "missing ) after condition")
 	if self.token == token.SEMICOLON {
 		self.next()
 	}
@@ -865,12 +882,12 @@ func (self *_parser) parseDoWhileStatement() ast.Statement {
 
 func (self *_parser) parseWhileStatement() ast.Statement {
 	idx := self.expect(token.WHILE)
-	self.expect(token.LEFT_PARENTHESIS)
+	self.expectWith(token.LEFT_PARENTHESIS, "missing ( before condition")
 	node := &ast.WhileStatement{
 		While: idx,
 		Test:  self.parseExpression(),
 	}
-	self.expect(token.RIGHT_PARENTHESIS)
+	self.expectWith(token.RIGHT_PARENTHESIS, "missing ) after condition")
 	node.Body = self.parseIterationStatement()
 
 	return node
@@ -878,11 +895,11 @@ func (self *_parser) parseWhileStatement() ast.Statement {
 
 func (self *_parser) parseIfStatement() ast.Statement {
 	self.expect(token.IF)
-	self.expect(token.LEFT_PARENTHESIS)
+	self.expectWith(token.LEFT_PARENTHESIS, "missing ( before condition")
 	node := &ast.IfStatement{
 		Test: self.parseExpression(),
 	}
-	self.expect(token.RIGHT_PARENTHESIS)
+	self.expectWith(token.RIGHT_PARENTHESIS, "missing ) after condition")
 
 	if self.token == token.LEFT_BRACE {
 		node.Consequent = self.parseBlockStatement()
@@ -910,13 +927,34 @@ func (self *_parser) parseSourceElements() (body []ast.Statement) {
 }
 
 func (self *_parser) parseProgram() *ast.Program {
+	var body []ast.Statement
+	if self.opts.paramListEnd > 0 {
+		body = self.parseStandaloneFunction()
+	} else {
+		body = self.parseSourceElements()
+	}
 	prg := &ast.Program{
-		Body:            self.parseSourceElements(),
+		Body:            body,
 		DeclarationList: self.scope.declarationList,
 		File:            self.file,
 	}
 	self.file.SetSourceMap(self.parseSourceMap())
 	return prg
+}
+
+// parseStandaloneFunction 把 Function 构造器拼接的源码解析为单个函数表达式，函数体之后还有记号时报告多余内容
+func (self *_parser) parseStandaloneFunction() []ast.Statement {
+	idx := self.idx
+	async := self.token == token.ASYNC
+	if async {
+		self.next()
+	}
+	function := self.parseFunction(false, async, idx)
+	function.Invoked = !async && !function.Generator
+	if self.token != token.EOF {
+		self.error(self.idx, "unexpected garbage after function body, starting with %s", self.describe(self.token))
+	}
+	return []ast.Statement{&ast.ExpressionStatement{Expression: function}}
 }
 
 func extractSourceMapLine(str string) string {

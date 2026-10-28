@@ -2,24 +2,27 @@ package goja
 
 import "github.com/Mag1cFall/goja/unistring"
 
-// orderOwnKeys 按 SpiderMonkey 的定义顺序重排对象的字符串键，未列出的键按原相对顺序排在其后
+// orderOwnKeys 按 SpiderMonkey 的定义顺序重排对象的字符串键，未列出的键按原相对顺序排在其后，整数键在枚举时仍按数值排在最前
 func (o *baseObject) orderOwnKeys(names ...string) {
+	if o.val.shape == nil {
+		return
+	}
+	current := o.val.shape.names
 	listed := make(map[unistring.String]bool, len(names))
-	ordered := make([]unistring.String, 0, len(o.propNames))
+	ordered := make([]unistring.String, 0, len(current))
 	for _, name := range names {
 		key := unistring.NewFromString(name)
-		if _, exists := o.values[key]; exists && !listed[key] {
+		if o.ownIndex(key) >= 0 && !listed[key] {
 			listed[key] = true
 			ordered = append(ordered, key)
 		}
 	}
-	for _, key := range o.propNames {
+	for _, key := range current {
 		if !listed[key] {
 			ordered = append(ordered, key)
 		}
 	}
-	o.propNames = ordered
-	o.lastSortedPropLen, o.idxPropCount = 0, 0
+	o.reorder(ordered)
 }
 
 // orderOwnKeys 物化模板属性后按给定顺序重排字符串键

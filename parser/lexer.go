@@ -581,7 +581,7 @@ func (self *_parser) skipMultiLineComment() (hasLineTerminator bool) {
 		}
 	}
 
-	self.errorUnexpected(0, self.chr)
+	self.error(file.Idx(0), "unterminated comment")
 	return
 }
 

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"sort"
 
 	"github.com/Mag1cFall/goja/unistring"
 )
@@ -49,6 +48,9 @@ var (
 type Object struct {
 	self    objectImpl
 	runtime *Runtime
+	shape   *shape
+	slots   []Value
+	kind    objectKind
 }
 
 type iterNextFunc func() (propIterItem, iterNextFunc)
@@ -216,11 +218,6 @@ type baseObject struct {
 	prototype  *Object
 	extensible bool
 
-	values    map[unistring.String]Value
-	propNames []unistring.String
-
-	lastSortedPropLen, idxPropCount int
-
 	symValues *orderedMap
 
 	privateElements map[*privateEnvType]*privateElements
@@ -269,8 +266,8 @@ func (f ConstructorCall) Argument(idx int) Value {
 	return _undefined
 }
 
+// init 是上游的对象初始化入口，形状与槽位在首次加键时建立
 func (o *baseObject) init() {
-	o.values = make(map[unistring.String]Value)
 }
 
 func (o *baseObject) className() string {
@@ -346,7 +343,7 @@ func (o *baseObject) getSym(s *Symbol, receiver Value) Value {
 }
 
 func (o *baseObject) getStr(name unistring.String, receiver Value) Value {
-	prop := o.values[name]
+	prop := o.ownValue(name)
 	if prop == nil {
 		if o.prototype != nil {
 			if receiver == nil {
@@ -376,7 +373,7 @@ func (o *baseObject) getOwnPropSym(s *Symbol) Value {
 }
 
 func (o *baseObject) getOwnPropStr(name unistring.String) Value {
-	return o.values[name]
+	return o.ownValue(name)
 }
 
 func (o *baseObject) checkDeleteProp(name unistring.String, prop *valueProperty, throw bool) bool {
@@ -398,29 +395,15 @@ func (o *baseObject) checkDelete(name unistring.String, val Value, throw bool) b
 }
 
 func (o *baseObject) _delete(name unistring.String) {
-	delete(o.values, name)
-	for i, n := range o.propNames {
-		if n == name {
-			names := o.propNames
-			if namesMarkedForCopy(names) {
-				newNames := make([]unistring.String, len(names)-1, shrinkCap(len(names), cap(names)))
-				copy(newNames, names[:i])
-				copy(newNames[i:], names[i+1:])
-				o.propNames = newNames
-			} else {
-				copy(names[i:], names[i+1:])
-				names[len(names)-1] = ""
-				o.propNames = names[:len(names)-1]
-			}
-			if i < o.lastSortedPropLen {
-				o.lastSortedPropLen--
-				if i < o.idxPropCount {
-					o.idxPropCount--
-				}
-			}
-			break
-		}
+	i := o.ownIndex(name)
+	if i < 0 {
+		return
 	}
+	o.toDict().dictRemove(i)
+	slots := o.val.slots
+	copy(slots[i:], slots[i+1:])
+	slots[len(slots)-1] = nil
+	o.val.slots = slots[:len(slots)-1]
 }
 
 func (o *baseObject) deleteIdx(idx valueInt, throw bool) bool {
@@ -440,7 +423,7 @@ func (o *baseObject) deleteSym(s *Symbol, throw bool) bool {
 }
 
 func (o *baseObject) deleteStr(name unistring.String, throw bool) bool {
-	if val, exists := o.values[name]; exists {
+	if val := o.ownValue(name); val != nil {
 		if !o.checkDelete(name, val, throw) {
 			return false
 		}
@@ -478,7 +461,11 @@ func (o *baseObject) setProto(proto *Object, throw bool) bool {
 }
 
 func (o *baseObject) setOwnStr(name unistring.String, val Value, throw bool) bool {
-	ownDesc := o.values[name]
+	i := o.ownIndex(name)
+	var ownDesc Value
+	if i >= 0 {
+		ownDesc = o.val.slots[i]
+	}
 	if ownDesc == nil {
 		if proto := o.prototype; proto != nil {
 			// we know it's foreign because prototype loops are not allowed
@@ -503,7 +490,7 @@ func (o *baseObject) setOwnStr(name unistring.String, val Value, throw bool) boo
 			prop.set(o.val, val)
 		}
 	} else {
-		o.values[name] = val
+		o.val.slots[i] = val
 	}
 	return true
 }
@@ -596,13 +583,12 @@ func (o *baseObject) _setForeignIdx(idx valueInt, prop, val, receiver Value, thr
 }
 
 func (o *baseObject) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
-	return o._setForeignStr(name, o.values[name], val, receiver, throw)
+	return o._setForeignStr(name, o.ownValue(name), val, receiver, throw)
 }
 
 func (o *baseObject) setForeignIdx(name valueInt, val, receiver Value, throw bool) (bool, bool) {
 	if idx := toIdx(name); idx != math.MaxUint32 {
-		o.ensurePropOrder()
-		if o.idxPropCount == 0 {
+		if !o.hasIdxKeys() {
 			return o._setForeignIdx(name, nil, val, receiver, throw)
 		}
 	}
@@ -644,8 +630,7 @@ func (o *baseObject) hasOwnPropertySym(s *Symbol) bool {
 }
 
 func (o *baseObject) hasOwnPropertyStr(name unistring.String) bool {
-	_, exists := o.values[name]
-	return exists
+	return o.ownIndex(name) >= 0
 }
 
 func (o *baseObject) hasOwnPropertyIdx(idx valueInt) bool {
@@ -754,13 +739,13 @@ func (o *baseObject) _defineOwnProperty(name unistring.String, existingValue Val
 	return existing, true
 
 Reject:
-	o.val.runtime.typeErrorResult(throw, "Cannot redefine property: %s", name)
+	o.val.runtime.typeErrorResult(throw, "can't redefine non-configurable property %s", spiderMonkeyQuote(stringValueFromRaw(name)))
 	return nil, false
 
 }
 
 func (o *baseObject) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
-	existingVal := o.values[name]
+	existingVal := o.ownValue(name)
 	if v, ok := o._defineOwnProperty(name, existingVal, descr, throw); ok {
 		o._put(name, v)
 		return true
@@ -788,15 +773,33 @@ func (o *baseObject) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, t
 }
 
 func (o *baseObject) _put(name unistring.String, v Value) {
-	if o.values == nil {
-		o.values = make(map[unistring.String]Value)
+	obj := o.val
+	s := obj.shape
+	if s == nil {
+		s = obj.runtime.rootShape()
 	}
-	if _, exists := o.values[name]; !exists {
-		names := copyNamesIfNeeded(o.propNames, 1)
-		o.propNames = append(names, name)
+	if !s.dict {
+		if c := s.transition(name); c != nil {
+			obj.shape = c
+			obj.slots = append(obj.slots, v)
+			return
+		}
 	}
-
-	o.values[name] = v
+	if i := s.lookup(name); i >= 0 {
+		obj.slots[i] = v
+		return
+	}
+	switch {
+	case s.dict:
+		s.dictAdd(name)
+	case len(s.names) >= shapeTreeMax:
+		s = s.toDict()
+		s.dictAdd(name)
+		obj.shape = s
+	default:
+		obj.shape = s.addChild(name)
+	}
+	obj.slots = append(obj.slots, v)
 }
 
 func valueProp(value Value, writable, enumerable, configurable bool) Value {
@@ -1187,78 +1190,18 @@ func (i *objectPropIter) next() (propIterItem, iterNextFunc) {
 	for i.idx < len(i.propNames) {
 		name := i.propNames[i.idx]
 		i.idx++
-		prop := i.o.values[name]
+		prop := i.o.ownValue(name)
 		if prop != nil {
 			return propIterItem{name: stringValueFromRaw(name), value: prop}, i.next
 		}
 	}
-	clearNamesCopyMarker(i.propNames)
 	return propIterItem{}, nil
 }
 
-var copyMarker = unistring.String(" ")
-
-// Set a copy-on-write flag so that any subsequent modifications of anything below the current length
-// trigger a copy.
-// The marker is a special value put at the index position of cap-1. Capacity is set so that the marker is
-// beyond the current length (therefore invisible to normal slice operations).
-// This function is called before an iteration begins to avoid copying of the names array if
-// there are no modifications within the iteration.
-// Note that the copying also occurs in two cases: nested iterations (on the same object) and
-// iterations after a previously abandoned iteration (because there is currently no mechanism to close an
-// iterator). It is still better than copying every time.
-func prepareNamesForCopy(names []unistring.String) []unistring.String {
-	if len(names) == 0 {
-		return names
-	}
-	if namesMarkedForCopy(names) || cap(names) == len(names) {
-		var newcap int
-		if cap(names) == len(names) {
-			newcap = growCap(len(names)+1, len(names), cap(names))
-		} else {
-			newcap = cap(names)
-		}
-		newNames := make([]unistring.String, len(names), newcap)
-		copy(newNames, names)
-		names = newNames
-	}
-	names[cap(names)-1 : cap(names)][0] = copyMarker
-	return names
-}
-
-func namesMarkedForCopy(names []unistring.String) bool {
-	return cap(names) > len(names) && names[cap(names)-1 : cap(names)][0] == copyMarker
-}
-
-func clearNamesCopyMarker(names []unistring.String) {
-	if cap(names) > len(names) {
-		names[cap(names)-1 : cap(names)][0] = ""
-	}
-}
-
-func copyNamesIfNeeded(names []unistring.String, extraCap int) []unistring.String {
-	if namesMarkedForCopy(names) && len(names)+extraCap >= cap(names) {
-		var newcap int
-		newsize := len(names) + extraCap + 1
-		if newsize > cap(names) {
-			newcap = growCap(newsize, len(names), cap(names))
-		} else {
-			newcap = cap(names)
-		}
-		newNames := make([]unistring.String, len(names), newcap)
-		copy(newNames, names)
-		return newNames
-	}
-	return names
-}
-
 func (o *baseObject) iterateStringKeys() iterNextFunc {
-	o.ensurePropOrder()
-	propNames := prepareNamesForCopy(o.propNames)
-	o.propNames = propNames
 	return (&objectPropIter{
 		o:         o,
-		propNames: propNames,
+		propNames: o.keyOrder(),
 	}).next
 }
 
@@ -1314,57 +1257,15 @@ func (o *baseObject) equal(objectImpl) bool {
 	return false
 }
 
-// hopefully this gets inlined
-func (o *baseObject) ensurePropOrder() {
-	if o.lastSortedPropLen < len(o.propNames) {
-		o.fixPropOrder()
-	}
-}
-
-// Reorder property names so that any integer properties are shifted to the beginning of the list
-// in ascending order. This is to conform to https://262.ecma-international.org/#sec-ordinaryownpropertykeys.
-// Personally I think this requirement is strange. I can sort of understand where they are coming from,
-// this way arrays can be specified just as objects with a 'magic' length property. However, I think
-// it's safe to assume most devs don't use Objects to store integer properties. Therefore, performing
-// property type checks when adding (and potentially looking up) properties would be unreasonable.
-// Instead, we keep insertion order and only change it when (if) the properties get enumerated.
-func (o *baseObject) fixPropOrder() {
-	names := o.propNames
-	for i := o.lastSortedPropLen; i < len(names); i++ {
-		name := names[i]
-		if idx := strToArrayIdx(name); idx != math.MaxUint32 {
-			k := sort.Search(o.idxPropCount, func(j int) bool {
-				return strToArrayIdx(names[j]) >= idx
-			})
-			if k < i {
-				if namesMarkedForCopy(names) {
-					newNames := make([]unistring.String, len(names), cap(names))
-					copy(newNames[:k], names)
-					copy(newNames[k+1:i+1], names[k:i])
-					copy(newNames[i+1:], names[i+1:])
-					names = newNames
-					o.propNames = names
-				} else {
-					copy(names[k+1:i+1], names[k:i])
-				}
-				names[k] = name
-			}
-			o.idxPropCount++
-		}
-	}
-	o.lastSortedPropLen = len(names)
-}
-
 func (o *baseObject) stringKeys(all bool, keys []Value) []Value {
-	o.ensurePropOrder()
+	names := o.keyOrder()
 	if all {
-		for _, k := range o.propNames {
+		for _, k := range names {
 			keys = append(keys, stringValueFromRaw(k))
 		}
 	} else {
-		for _, k := range o.propNames {
-			prop := o.values[k]
-			if prop, ok := prop.(*valueProperty); ok && !prop.enumerable {
+		for i, k := range names {
+			if prop, ok := o.val.slots[i].(*valueProperty); ok && !prop.enumerable {
 				continue
 			}
 			keys = append(keys, stringValueFromRaw(k))

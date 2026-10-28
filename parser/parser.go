@@ -54,6 +54,8 @@ const (
 type options struct {
 	disableSourceMaps bool
 	sourceMapLoader   func(path string) ([]byte, error)
+	// paramListEnd 是 Function 构造器源码中形参列表结束处右括号的字节偏移，非零时按独立函数解析
+	paramListEnd int
 }
 
 // Option represents one of the options for the parser to use in the Parse methods. Currently supported are:
@@ -77,6 +79,13 @@ func WithSourceMapLoader(loader func(path string) ([]byte, error)) Option {
 	}
 }
 
+// WithFunctionConstructor 让解析器按 SpiderMonkey standaloneFunction 解析 Function 构造器拼接的源码，paramListEnd 是形参列表结束处右括号的字节偏移
+func WithFunctionConstructor(paramListEnd int) Option {
+	return func(opts *options) {
+		opts.paramListEnd = paramListEnd
+	}
+}
+
 type _parser struct {
 	str    string
 	length int
@@ -93,6 +102,7 @@ type _parser struct {
 
 	scope             *_scope
 	parenStart        file.Idx // parenStart 是最近一个括号表达式内首个记号的位置
+	arrowParams       bool     // arrowParams 表示正在把括号表达式重新解析为箭头函数形参
 	insertSemicolon   bool     // If we see a newline, then insert an implicit semicolon
 	implicitSemicolon bool     // An implicit semicolon exists
 
@@ -259,6 +269,16 @@ func (self *_parser) expect(value token.Token) file.Idx {
 	idx := self.idx
 	if self.token != value {
 		self.errorUnexpectedToken(self.token)
+	}
+	self.next()
+	return idx
+}
+
+// expectWith 要求当前词法单元为 value，否则按 SpiderMonkey mustMatchToken 在当前位置报告 msg
+func (self *_parser) expectWith(value token.Token, msg string) file.Idx {
+	idx := self.idx
+	if self.token != value {
+		self.error(idx, msg)
 	}
 	self.next()
 	return idx

@@ -71,7 +71,18 @@ type baseJsFuncObject struct {
 	prg    *Program
 	src    string
 	strict bool
+
+	// lazy 是尚未定义的 length、name 与 prototype 自有属性，lazyName 是 name 定义时的值
+	lazy     uint8
+	lazyName unistring.String
 }
+
+// 惰性自有属性的位
+const (
+	lazyLengthProp uint8 = 1 << iota
+	lazyNameProp
+	lazyPrototypeProp
+)
 
 type funcObject struct {
 	baseJsFuncObject
@@ -171,8 +182,8 @@ func (f *wrappedFuncObject) export(*objectExportCtx) interface{} {
 }
 
 func (f *funcObject) _addProto(n unistring.String) Value {
-	if n == "prototype" {
-		if _, exists := f.values[n]; !exists {
+	if n == "prototype" && f.lazy == 0 {
+		if f.ownIndex(n) < 0 {
 			return f.addPrototype()
 		}
 	}
@@ -188,12 +199,12 @@ func (f *funcObject) getOwnPropStr(name unistring.String) Value {
 		return v
 	}
 
-	return f.baseObject.getOwnPropStr(name)
+	return f.baseJsFuncObject.getOwnPropStr(name)
 }
 
 func (f *funcObject) setOwnStr(name unistring.String, val Value, throw bool) bool {
 	f._addProto(name)
-	return f.baseObject.setOwnStr(name, val, throw)
+	return f.baseJsFuncObject.setOwnStr(name, val, throw)
 }
 
 func (f *funcObject) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
@@ -202,12 +213,12 @@ func (f *funcObject) setForeignStr(name unistring.String, val, receiver Value, t
 
 func (f *funcObject) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
 	f._addProto(name)
-	return f.baseObject.defineOwnPropertyStr(name, descr, throw)
+	return f.baseJsFuncObject.defineOwnPropertyStr(name, descr, throw)
 }
 
 func (f *funcObject) deleteStr(name unistring.String, throw bool) bool {
 	f._addProto(name)
-	return f.baseObject.deleteStr(name, throw)
+	return f.baseJsFuncObject.deleteStr(name, throw)
 }
 
 func (f *funcObject) addPrototype() Value {
@@ -217,29 +228,152 @@ func (f *funcObject) addPrototype() Value {
 }
 
 func (f *funcObject) hasOwnPropertyStr(name unistring.String) bool {
-	if f.baseObject.hasOwnPropertyStr(name) {
+	if f.baseJsFuncObject.hasOwnPropertyStr(name) {
 		return true
 	}
 
-	if name == "prototype" {
+	if name == "prototype" && f.lazy == 0 {
 		return true
 	}
 	return false
 }
 
 func (f *funcObject) stringKeys(all bool, accum []Value) []Value {
-	if all {
-		if _, exists := f.values["prototype"]; !exists {
+	if all && f.lazy == 0 {
+		if f.ownIndex("prototype") < 0 {
 			accum = append(accum, asciiString("prototype"))
 		}
 	}
-	return f.baseFuncObject.stringKeys(all, accum)
+	return f.baseJsFuncObject.stringKeys(all, accum)
 }
 
 func (f *funcObject) iterateStringKeys() iterNextFunc {
-	if _, exists := f.values["prototype"]; !exists {
+	if f.lazy == 0 && f.ownIndex("prototype") < 0 {
 		f.addPrototype()
 	}
+	return f.baseJsFuncObject.iterateStringKeys()
+}
+
+// initJs 设置 JS 函数的 length 与 name：宿主脚本的函数立即定义；其余函数按 SpiderMonkey fun_resolve 在首次按名访问时定义，prototype 为 true 时 prototype 同样惰性定义
+func (f *baseJsFuncObject) initJs(name unistring.String, length int, host, prototype bool) {
+	if host {
+		f.init(name, intToValue(int64(length)))
+		return
+	}
+	f.baseObject.init()
+	f.lenProp.configurable = true
+	f.lenProp.value = intToValue(int64(length))
+	f.lazyName = name
+	f.lazy = lazyLengthProp | lazyNameProp
+	if prototype {
+		f.lazy |= lazyPrototypeProp
+	}
+}
+
+// jsFunc 返回 JS 函数对象共有的部分
+func (f *baseJsFuncObject) jsFunc() *baseJsFuncObject {
+	return f
+}
+
+// resolveOwn 定义 name 对应的惰性自有属性，追加在已有属性之后
+func (f *baseJsFuncObject) resolveOwn(name unistring.String) {
+	if f.lazy == 0 {
+		return
+	}
+	switch name {
+	case "length":
+		if f.lazy&lazyLengthProp != 0 {
+			f.lazy &^= lazyLengthProp
+			f._put("length", &f.lenProp)
+		}
+	case "name":
+		if f.lazy&lazyNameProp != 0 {
+			f.lazy &^= lazyNameProp
+			f._putProp("name", stringValueFromRaw(f.lazyName), false, false, true)
+		}
+	case "prototype":
+		if f.lazy&lazyPrototypeProp != 0 {
+			f.lazy &^= lazyPrototypeProp
+			f.definePrototype()
+		}
+	}
+}
+
+// resolveAll 按 SpiderMonkey fun_enumerate 依次定义尚未定义的 prototype、length 与 name
+func (f *baseJsFuncObject) resolveAll() {
+	if f.lazy != 0 {
+		f.resolveOwn("prototype")
+		f.resolveOwn("length")
+		f.resolveOwn("name")
+	}
+}
+
+// definePrototype 定义函数的 prototype 自有属性：普通函数为带 constructor 的对象，生成器为继承生成器原型的空对象
+func (f *baseJsFuncObject) definePrototype() {
+	r := f.val.runtime
+	switch f.val.self.(type) {
+	case *funcObject:
+		proto := r.NewObject()
+		proto.self._putProp("constructor", f.val, true, false, true)
+		f._putProp("prototype", proto, true, false, false)
+	case *generatorFuncObject, *generatorMethodFuncObject:
+		f._putProp("prototype", r.newBaseObject(r.getGeneratorPrototype(), classObject).val, true, false, false)
+	case *asyncGeneratorFuncObject, *asyncGeneratorMethodFuncObject:
+		f._putProp("prototype", r.newBaseObject(r.getAsyncGeneratorPrototype(), classObject).val, true, false, false)
+	}
+}
+
+// setLazyName 在 name 尚未定义时更新其定义值并返回 true，与 SpiderMonkey SetFunctionName 只设置函数名而不定义属性一致
+func (f *baseJsFuncObject) setLazyName(name String) bool {
+	if f.lazy&lazyNameProp == 0 {
+		return false
+	}
+	f.lazyName = name.string()
+	return true
+}
+
+func (f *baseJsFuncObject) getStr(name unistring.String, receiver Value) Value {
+	f.resolveOwn(name)
+	return f.baseFuncObject.getStr(name, receiver)
+}
+
+func (f *baseJsFuncObject) getOwnPropStr(name unistring.String) Value {
+	f.resolveOwn(name)
+	return f.baseFuncObject.getOwnPropStr(name)
+}
+
+func (f *baseJsFuncObject) hasOwnPropertyStr(name unistring.String) bool {
+	f.resolveOwn(name)
+	return f.baseFuncObject.hasOwnPropertyStr(name)
+}
+
+func (f *baseJsFuncObject) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	f.resolveOwn(name)
+	return f.baseFuncObject.setOwnStr(name, val, throw)
+}
+
+func (f *baseJsFuncObject) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	f.resolveOwn(name)
+	return f.baseFuncObject.setForeignStr(name, val, receiver, throw)
+}
+
+func (f *baseJsFuncObject) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	f.resolveOwn(name)
+	return f.baseFuncObject.defineOwnPropertyStr(name, descr, throw)
+}
+
+func (f *baseJsFuncObject) deleteStr(name unistring.String, throw bool) bool {
+	f.resolveOwn(name)
+	return f.baseFuncObject.deleteStr(name, throw)
+}
+
+func (f *baseJsFuncObject) stringKeys(all bool, accum []Value) []Value {
+	f.resolveAll()
+	return f.baseFuncObject.stringKeys(all, accum)
+}
+
+func (f *baseJsFuncObject) iterateStringKeys() iterNextFunc {
+	f.resolveAll()
 	return f.baseFuncObject.iterateStringKeys()
 }
 
@@ -310,7 +444,7 @@ func (f *classFuncObject) createInstance(args []Value, newTarget *Object) (insta
 		if ctor := f.prototype.self.assertConstructor(); ctor != nil {
 			instance = ctor(args, newTarget)
 		} else {
-			panic(f.val.runtime.NewTypeError("Super constructor is not a constructor"))
+			panic(f.val.runtime.NewTypeError("super is not a constructor"))
 		}
 	} else {
 		instance = f.baseFuncObject.createInstance(newTarget)
@@ -599,6 +733,11 @@ func (f *nativeFuncObject) vmCall(vm *vm, n int) {
 
 func (f *nativeFuncObject) assertConstructor() func(args []Value, newTarget *Object) *Object {
 	return f.construct
+}
+
+// source 返回绑定函数的源码文本，与 SpiderMonkey 相同不带函数名
+func (f *boundFuncObject) source() String {
+	return asciiString("function() {\n    [native code]\n}")
 }
 
 func (f *boundFuncObject) hasInstance(v Value) bool {

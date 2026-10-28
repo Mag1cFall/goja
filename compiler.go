@@ -77,6 +77,8 @@ type Program struct {
 	src         *file.File
 	srcMap      []srcMapItem
 	calleeText  map[int]string
+	// argTexts 是调用与 new 指令各实参的 SpiderMonkey 反编译文本，原生函数报告实参错误时使用
+	argTexts map[int][]string
 	// regexps 表示实例化本段代码时需要创建正则字面量对象，包含随其编译的立即调用函数
 	regexps bool
 	// generators 表示本段代码及其全部嵌套函数中含有同步生成器函数
@@ -89,6 +91,12 @@ type Program struct {
 	ionEntry int
 	// ion 表示函数已改用 Ion 代码
 	ion bool
+	// baseline 表示代码已进入 SpiderMonkey 基线解释器，属性读取经过内联缓存
+	baseline bool
+	// functionICs 是读取 name 与 length 的指令位置上的内联缓存状态
+	functionICs map[int]*functionIC
+	// lazy 表示函数代码在 SpiderMonkey 中首次调用时才生成字节码
+	lazy bool
 	// failedSites 是属性访问出过错的指令位置
 	failedSites map[int]bool
 	// icSites 是触发 Ion 编译时 failedSites 的快照，Ion 代码中这些位置出错时不反编译基址表达式
@@ -97,6 +105,8 @@ type Program struct {
 	bailouts int
 	// host 表示代码是代表浏览器原生实现的宿主脚本，不计预热
 	host bool
+	// shared 表示代码由 Compile 编译、可在多个 Runtime 中同时运行，不记录预热与内联缓存状态
+	shared bool
 }
 
 // ionWarmUpThreshold 是 SpiderMonkey 触发 Ion 编译的预热计数
@@ -111,12 +121,28 @@ const ionBailoutThreshold = 10
 // baselineWarmUpThreshold 是 SpiderMonkey 基线编译的预热计数，Ion 代码作废后预热计数回落到该值
 const baselineWarmUpThreshold = 100
 
+// baselineInterpreterWarmUpThreshold 是 SpiderMonkey 进入基线解释器的预热计数
+const baselineInterpreterWarmUpThreshold = 10
+
+// functionIC 是一处读取函数 name 或 length 的指令上 SpiderMonkey 基线内联缓存的状态
+type functionIC struct {
+	// attached 表示已附加 GetProp.FunctionName 或 GetProp.FunctionLength 存根
+	attached bool
+	// generic 表示失败次数达到上限后转为 Generic，不再附加存根
+	generic bool
+	// stubs 与 failures 是 ICState 的已附加存根数与附加失败次数
+	stubs, failures int
+}
+
 // enterFunction 在函数进入时累计预热计数，后台编译结束后的下一次进入改用 Ion 代码
 func (p *Program) enterFunction() {
-	if p.host {
+	if p.host || p.shared {
 		return
 	}
 	p.entries++
+	if p.warmUp >= baselineInterpreterWarmUpThreshold {
+		p.baseline = true
+	}
 	p.countWarmUp()
 	if !p.ion && p.ionEntry != 0 && p.entries > p.ionEntry {
 		p.ion = true
@@ -125,7 +151,7 @@ func (p *Program) enterFunction() {
 
 // countWarmUp 累计一次预热，达到 Ion 阈值时记录改用 Ion 代码的进入序号
 func (p *Program) countWarmUp() {
-	if p.host {
+	if p.host || p.shared {
 		return
 	}
 	p.warmUp++
@@ -160,6 +186,8 @@ type compiler struct {
 	block *block
 	// host 表示正在编译宿主脚本，新建的函数代码都不计预热
 	host bool
+	// shared 表示正在编译可在多个 Runtime 中同时运行的代码
+	shared bool
 
 	guessedNames map[file.Idx]unistring.String
 	separator    file.Idx
@@ -179,6 +207,8 @@ type compiler struct {
 	lazy bool
 	// inFunc 表示当前编译的代码位于函数体内
 	inFunc bool
+	// programs 是本次编译生成的函数与类字段初始化程序，编译结束后统一合并指令
+	programs []*Program
 }
 
 type binding struct {
@@ -950,6 +980,13 @@ func (s *scope) trimCode(delta int) {
 			}
 			s.c.p.calleeText = shifted
 		}
+		if texts := s.c.p.argTexts; texts != nil {
+			shifted := make(map[int][]string, len(texts))
+			for pc, text := range texts {
+				shifted[pc-delta] = text
+			}
+			s.c.p.argTexts = shifted
+		}
 		s.adjustBase(-delta)
 	}
 }
@@ -1262,12 +1299,12 @@ func (c *compiler) createVarBindings(v *ast.VariableDeclaration, inFunc bool) {
 }
 
 func (c *compiler) createLexicalIdBinding(name unistring.String, isConst bool, offset int) *binding {
-	if name == "let" {
-		c.throwSyntaxError(offset, "let is disallowed as a lexically bound name")
-	}
 	if c.scope.strict {
 		c.checkIdentifierLName(name, offset)
 		c.checkIdentifierName(name, offset)
+	}
+	if name == "let" {
+		c.throwSyntaxError(offset, "a lexical declaration can't define a 'let' binding")
 	}
 	b, _ := c.scope.bindNameLexical(name, true, offset)
 	if isConst {
@@ -1277,12 +1314,12 @@ func (c *compiler) createLexicalIdBinding(name unistring.String, isConst bool, o
 }
 
 func (c *compiler) createLexicalIdBindingFuncBody(name unistring.String, isConst bool, offset int, calleeBinding *binding) *binding {
-	if name == "let" {
-		c.throwSyntaxError(offset, "let is disallowed as a lexically bound name")
-	}
 	if c.scope.strict {
 		c.checkIdentifierLName(name, offset)
 		c.checkIdentifierName(name, offset)
+	}
+	if name == "let" {
+		c.throwSyntaxError(offset, "a lexical declaration can't define a 'let' binding")
 	}
 	paramScope := c.scope.outer
 	parentBinding := paramScope.boundNames[name]
@@ -1323,6 +1360,7 @@ func (c *compiler) compileLexicalDeclarations(list []ast.Statement, scopeDeclare
 				c.newBlockScope()
 				scopeDeclared = true
 			}
+			c.checkIdentifierName(cls.Class.Name.Name, int(cls.Class.Name.Idx)-1)
 			c.createLexicalIdBinding(cls.Class.Name.Name, false, int(cls.Class.Name.Idx)-1)
 		}
 	}
@@ -1423,14 +1461,14 @@ func (c *compiler) isStrictStatement(s ast.Statement) *ast.StringLiteral {
 func (c *compiler) checkIdentifierName(name unistring.String, offset int) {
 	switch name {
 	case "implements", "interface", "let", "package", "private", "protected", "public", "static", "yield":
-		c.throwSyntaxError(offset, "Unexpected strict mode reserved word")
+		c.throwSyntaxErrorf(offset, "%s is a reserved identifier", name)
 	}
 }
 
 func (c *compiler) checkIdentifierLName(name unistring.String, offset int) {
 	switch name {
 	case "eval", "arguments":
-		c.throwSyntaxError(offset, "Assignment to eval or arguments is not allowed in strict mode")
+		c.throwSyntaxErrorf(offset, "'%s' can't be defined or assigned to in strict mode code", name)
 	}
 }
 
@@ -1451,8 +1489,9 @@ func (c *compiler) enterDummyMode() (leaveFunc func()) {
 		}
 	}
 	c.p = &Program{
-		src:  c.p.src,
-		host: c.host,
+		src:    c.p.src,
+		host:   c.host,
+		shared: c.shared,
 	}
 	dummy := c.p
 	c.newScope()

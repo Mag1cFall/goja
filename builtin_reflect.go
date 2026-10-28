@@ -7,10 +7,12 @@ func (r *Runtime) builtin_reflect_apply(call FunctionCall) Value {
 }
 
 func (r *Runtime) toConstructor(v Value) func(args []Value, newTarget *Object) *Object {
-	if ctor := r.toObject(v).self.assertConstructor(); ctor != nil {
-		return ctor
+	if obj, ok := v.(*Object); ok {
+		if ctor := obj.self.assertConstructor(); ctor != nil {
+			return ctor
+		}
 	}
-	panic(r.NewTypeError("Value is not a constructor"))
+	panic(r.NewTypeError("%s is not a constructor", r.argumentText(v)))
 }
 
 func (r *Runtime) builtin_reflect_construct(call FunctionCall) Value {

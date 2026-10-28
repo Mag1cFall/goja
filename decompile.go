@@ -53,6 +53,10 @@ func decompileExpression(expression ast.Expression) string {
 		if value, ok := foldNumeric(node); ok {
 			return formatNumber(value)
 		}
+	case *ast.TemplateLiteral:
+		if node.Tag != nil {
+			return decompileExpression(node.Tag) + "(...)"
+		}
 	}
 	return "(intermediate value)"
 }
@@ -122,6 +126,22 @@ func numericConstant(expression ast.Expression) (float64, bool) {
 		return foldNumeric(node)
 	}
 	return 0, false
+}
+
+// argumentTexts 返回各实参的反编译文本，展开实参为 (intermediate value)
+func argumentTexts(arguments []ast.Expression) []string {
+	if len(arguments) == 0 {
+		return nil
+	}
+	texts := make([]string, len(arguments))
+	for i, argument := range arguments {
+		if _, spread := argument.(*ast.SpreadElement); spread {
+			texts[i] = "(intermediate value)"
+			continue
+		}
+		texts[i] = decompileExpression(argument)
+	}
+	return texts
 }
 
 // argumentsText 按 SpiderMonkey 反编译规则返回调用的实参部分，有实参时省略为 (...)

@@ -220,6 +220,9 @@ type Runtime struct {
 
 	// templateResolver 生成 ObjectTemplate 中按需访问的属性
 	templateResolver func(id string, index int) TemplateProperty
+
+	emptyShape     *shape
+	templateShapes map[*objectTemplate]*shape
 }
 
 type agentJob struct {
@@ -229,10 +232,11 @@ type agentJob struct {
 
 // Agent 在多个 Runtime 之间共享 JavaScript 微任务队列
 type Agent struct {
-	depth     int
-	draining  bool
-	jobs      []agentJob
-	lastThrow *Exception
+	depth      int
+	draining   bool
+	jobs       []agentJob
+	lastThrow  *Exception
+	propCaches []*propCache
 }
 
 type StackFrame struct {
@@ -581,36 +585,38 @@ func (r *Runtime) NewGoError(err error) *Object {
 	return e
 }
 
-func (r *Runtime) newFunc(name unistring.String, length int, strict bool) (f *funcObject) {
+func (r *Runtime) newFunc(name unistring.String, length int, strict, host bool) (f *funcObject) {
 	f = &funcObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, true)
 	return
 }
 
-func (r *Runtime) newAsyncFunc(name unistring.String, length int, strict bool) (f *asyncFuncObject) {
+func (r *Runtime) newAsyncFunc(name unistring.String, length int, strict, host bool) (f *asyncFuncObject) {
 	f = &asyncFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.class = classFunction
 	f.prototype = r.getAsyncFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
-func (r *Runtime) newGeneratorFunc(name unistring.String, length int, strict bool) (f *generatorFuncObject) {
+func (r *Runtime) newGeneratorFunc(name unistring.String, length int, strict, host bool) (f *generatorFuncObject) {
 	f = &generatorFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.class = classFunction
 	f.prototype = r.getGeneratorFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
-	f._putProp("prototype", r.newBaseObject(r.getGeneratorPrototype(), classObject).val, true, false, false)
+	f.initJs(name, length, host, true)
+	if host {
+		f._putProp("prototype", r.newBaseObject(r.getGeneratorPrototype(), classObject).val, true, false, false)
+	}
 	return
 }
 
-func (r *Runtime) newClassFunc(name unistring.String, length int, proto *Object, derived bool) (f *classFuncObject) {
+func (r *Runtime) newClassFunc(name unistring.String, length int, proto *Object, derived, host bool) (f *classFuncObject) {
 	v := &Object{runtime: r}
 
 	f = &classFuncObject{}
@@ -621,7 +627,7 @@ func (r *Runtime) newClassFunc(name unistring.String, length int, proto *Object,
 	f.derived = derived
 	v.self = f
 	f.prototype = proto
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
@@ -635,29 +641,31 @@ func (r *Runtime) initBaseJsFunction(f *baseJsFuncObject, strict bool) {
 	f.prototype = r.getFunctionPrototype()
 }
 
-func (r *Runtime) newMethod(name unistring.String, length int, strict bool) (f *methodFuncObject) {
+func (r *Runtime) newMethod(name unistring.String, length int, strict, host bool) (f *methodFuncObject) {
 	f = &methodFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
-func (r *Runtime) newGeneratorMethod(name unistring.String, length int, strict bool) (f *generatorMethodFuncObject) {
+func (r *Runtime) newGeneratorMethod(name unistring.String, length int, strict, host bool) (f *generatorMethodFuncObject) {
 	f = &generatorMethodFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.prototype = r.getGeneratorFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
-	f._putProp("prototype", r.newBaseObject(r.getGeneratorPrototype(), classObject).val, true, false, false)
+	f.initJs(name, length, host, true)
+	if host {
+		f._putProp("prototype", r.newBaseObject(r.getGeneratorPrototype(), classObject).val, true, false, false)
+	}
 	return
 }
 
-func (r *Runtime) newAsyncMethod(name unistring.String, length int, strict bool) (f *asyncMethodFuncObject) {
+func (r *Runtime) newAsyncMethod(name unistring.String, length int, strict, host bool) (f *asyncMethodFuncObject) {
 	f = &asyncMethodFuncObject{}
 	r.initBaseJsFunction(&f.baseJsFuncObject, strict)
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
@@ -666,21 +674,21 @@ func (r *Runtime) initArrowFunc(f *arrowFuncObject, strict bool) {
 	f.newTarget = r.vm.newTarget
 }
 
-func (r *Runtime) newArrowFunc(name unistring.String, length int, strict bool) (f *arrowFuncObject) {
+func (r *Runtime) newArrowFunc(name unistring.String, length int, strict, host bool) (f *arrowFuncObject) {
 	f = &arrowFuncObject{}
 	r.initArrowFunc(f, strict)
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
-func (r *Runtime) newAsyncArrowFunc(name unistring.String, length int, strict bool) (f *asyncArrowFuncObject) {
+func (r *Runtime) newAsyncArrowFunc(name unistring.String, length int, strict, host bool) (f *asyncArrowFuncObject) {
 	f = &asyncArrowFuncObject{}
 	r.initArrowFunc(&f.arrowFuncObject, strict)
 	f.class = classObject
 	f.prototype = r.getAsyncFunctionPrototype()
 	f.val.self = f
-	f.init(name, intToValue(int64(length)))
+	f.initJs(name, length, host, false)
 	return
 }
 
@@ -946,7 +954,16 @@ func (r *Runtime) builtin_thrower(call FunctionCall) Value {
 }
 
 func (r *Runtime) eval(srcVal String, direct, strict bool) Value {
-	src := escapeInvalidUtf16(srcVal)
+	return r.evalSource(escapeInvalidUtf16(srcVal), "eval", direct, strict)
+}
+
+// evalFunction 编译并求值 Function 构造器拼接的独立函数源码，paramListEnd 是形参列表结束处右括号的字节偏移
+func (r *Runtime) evalFunction(src string, paramListEnd int) Value {
+	return r.evalSource(src, "Function", false, false, parser.WithFunctionConstructor(paramListEnd))
+}
+
+// evalSource 按 eval 语义编译并执行 src，kind 是 SpiderMonkey 源码名中调用者之后的引入方式
+func (r *Runtime) evalSource(src, kind string, direct, strict bool, options ...parser.Option) Value {
 	vm := r.vm
 	sourceName := "<eval>"
 	callerPrg, callerPC := vm.prg, vm.pc
@@ -957,7 +974,7 @@ func (r *Runtime) eval(srcVal String, direct, strict bool) Value {
 	if callerPrg != nil && callerPrg.src != nil {
 		position := callerPrg.src.Position(callerPrg.sourceOffset(callerPC))
 		if position.Filename != "" {
-			sourceName = fmt.Sprintf("%s line %d > eval", position.Filename, position.Line)
+			sourceName = fmt.Sprintf("%s line %d > %s", position.Filename, position.Line, kind)
 		}
 	}
 	inGlobal := true
@@ -981,7 +998,7 @@ func (r *Runtime) eval(srcVal String, direct, strict bool) Value {
 		}
 	}
 	vm.prg = nil
-	p, err := r.compile(sourceName, src, strict, inGlobal, r.vm)
+	p, err := r.compile(sourceName, src, strict, inGlobal, r.vm, options...)
 	if err != nil {
 		panic(err)
 	}
@@ -1034,6 +1051,38 @@ func (r *Runtime) wrapNativeConstruct(c func(args []Value, proto *Object) *Objec
 		}
 		return c(args, proto)
 	}
+}
+
+// argumentText 按 SpiderMonkey JSDVG_SEARCH_STACK 返回原生函数实参 v 在调用处的反编译文本，调用处没有该实参时为值的源码形式
+func (r *Runtime) argumentText(v Value) string {
+	vm := r.vm
+	prg, pc, args := vm.prg, vm.pc, []Value(nil)
+	if prg == nil && len(vm.callStack) > 0 {
+		frame := vm.callStack[len(vm.callStack)-1]
+		prg, pc, args = frame.prg, frame.pc, vm.stack[vm.sb:vm.sp]
+	} else if prg != nil && pc < len(prg.code) {
+		if n, ok := prg.code[pc].(_new); ok {
+			args = vm.stack[vm.sp-int(n) : vm.sp]
+		}
+	}
+	if prg != nil {
+		if texts := prg.argTexts[pc]; len(texts) == len(args) {
+			for i, arg := range args {
+				if arg.SameAs(v) {
+					return texts[i]
+				}
+			}
+		}
+	}
+	return valueSource(v)
+}
+
+// valueSource 返回错误消息中值的源码形式，与 SpiderMonkey ValueToSource 对原始值的输出相同
+func valueSource(v Value) string {
+	if s, ok := v.(String); ok {
+		return spiderMonkeyQuote(s)
+	}
+	return v.toString().String()
 }
 
 func (r *Runtime) toCallable(v Value) func(FunctionCall) Value {
@@ -1430,14 +1479,21 @@ func (r *Runtime) transformEvalArgument(value Value) Value {
 // method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
 // at the same time).
 func Compile(name, src string, strict bool) (*Program, error) {
-	return compile(name, src, strict, true, nil)
+	prg, err := Parse(name, src)
+	if err != nil {
+		return nil, err
+	}
+	return CompileAST(prg, strict)
 }
 
 // CompileAST creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
 // method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
 // at the same time).
 func CompileAST(prg *js_ast.Program, strict bool) (*Program, error) {
-	return compileAST(prg, strict, true, nil)
+	c := newCompiler()
+	c.shared = true
+	c.p.shared = true
+	return compileWith(c, prg, strict, true, nil)
 }
 
 // MustCompile is like Compile but panics if the code cannot be compiled.
@@ -1532,14 +1588,21 @@ func compileWith(c *compiler, prg *js_ast.Program, strict, inGlobal bool, evalVm
 
 	c.compile(prg, strict, inGlobal, evalVm)
 	p = c.p
+	p.fuse()
+	for _, inner := range c.programs {
+		inner.fuse()
+	}
 	return
 }
 
-func (r *Runtime) compile(name, src string, strict, inGlobal bool, evalVm *vm) (p *Program, err error) {
-	p, err = compile(name, src, strict, inGlobal, evalVm, r.parserOptions...)
+func (r *Runtime) compile(name, src string, strict, inGlobal bool, evalVm *vm, options ...parser.Option) (p *Program, err error) {
+	p, err = compile(name, src, strict, inGlobal, evalVm, append(options, r.parserOptions...)...)
 	if err != nil {
 		switch x1 := err.(type) {
 		case *CompilerSyntaxError:
+			if x1.Position.Line == 0 && x1.File != nil {
+				x1.Position = x1.File.Position(x1.Offset)
+			}
 			value := r.builtin_new(r.getSyntaxError(), []Value{newStringValue(x1.Message)})
 			if x1.Position.Line > 0 {
 				value.self._putProp("fileName", r.ToValue(name), true, false, true)

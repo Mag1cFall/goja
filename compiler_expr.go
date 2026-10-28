@@ -1,6 +1,7 @@
 package goja
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/Mag1cFall/goja/ast"
@@ -29,6 +30,7 @@ type compiledCallExpr struct {
 	args       []compiledExpr
 	callee     compiledExpr
 	calleeText string
+	argTexts   []string
 
 	isVariadic bool
 }
@@ -261,7 +263,7 @@ func (c *compiler) compileExpression(v ast.Expression) compiledExpr {
 		r.init(c, v.Idx0())
 		return r
 	case *ast.SuperExpression:
-		c.throwSyntaxError(int(v.Idx0())-1, "'super' keyword unexpected here")
+		c.throwSyntaxError(int(v.Idx0())-1, "invalid use of keyword 'super'")
 		panic("unreachable")
 	case *ast.SequenceExpression:
 		return c.compileSequenceExpression(v)
@@ -354,7 +356,7 @@ func (e *compiledIdentifierExpr) emitGetter(putOnStack bool) {
 		if b != nil {
 			b.emitGetVar(false)
 		} else {
-			e.c.emit(loadDynamic(e.name))
+			e.c.emit(loadDynamicCached{newDynName(e.name)})
 		}
 		if !putOnStack {
 			e.c.emit(pop)
@@ -371,7 +373,7 @@ func (e *compiledIdentifierExpr) emitGetterOrRef() {
 		if b != nil {
 			b.emitGetVar(false)
 		} else {
-			e.c.emit(loadDynamicRef(e.name))
+			e.c.emit(loadDynamicRef{newDynName(e.name)})
 		}
 	}
 }
@@ -386,7 +388,7 @@ func (e *compiledIdentifierExpr) emitGetterAndCallee() {
 		if b != nil {
 			b.emitGetVar(true)
 		} else {
-			e.c.emit(loadDynamicCallee(e.name))
+			e.c.emit(loadDynamicCallee{newDynName(e.name)})
 		}
 	}
 }
@@ -632,20 +634,21 @@ type compiledPrivateDotExpr struct {
 	name unistring.String
 }
 
-func (c *compiler) checkSuperBase(idx file.Idx) {
+// checkSuperBase 要求 super 属性访问位于方法内，否则在 idx 处按 SpiderMonkey 报告 access 种类的访问错误
+func (c *compiler) checkSuperBase(idx file.Idx, access string) {
 	if s := c.scope.nearestThis(); s != nil {
 		switch s.funcType {
 		case funcMethod, funcClsInit, funcCtor, funcDerivedCtor:
 			return
 		}
 	}
-	c.throwSyntaxError(int(idx)-1, "'super' keyword unexpected here")
+	c.throwSyntaxErrorf(int(idx)-1, "use of super %s accesses only valid within methods or eval code within methods", access)
 	panic("unreachable")
 }
 
 func (c *compiler) compileDotExpression(v *ast.DotExpression) compiledExpr {
-	if sup, ok := v.Left.(*ast.SuperExpression); ok {
-		c.checkSuperBase(sup.Idx)
+	if _, ok := v.Left.(*ast.SuperExpression); ok {
+		c.checkSuperBase(v.Identifier.Idx, "property")
 		r := &compiledSuperDotExpr{
 			name: v.Identifier.Name,
 		}
@@ -879,8 +882,8 @@ func (c *compiler) checkConstantString(expr compiledExpr) (unistring.String, boo
 }
 
 func (c *compiler) compileBracketExpression(v *ast.BracketExpression) compiledExpr {
-	if sup, ok := v.Left.(*ast.SuperExpression); ok {
-		c.checkSuperBase(sup.Idx)
+	if _, ok := v.Left.(*ast.SuperExpression); ok {
+		c.checkSuperBase(v.RightBracket, "member")
 		member := c.compileExpression(v.Member)
 		if name, ok := c.checkConstantString(member); ok {
 			r := &compiledSuperDotExpr{
@@ -927,6 +930,8 @@ func (c *compiler) callCoordinate(v *ast.CallExpression) file.Idx {
 		if key, ok := callee.Member.(*ast.StringLiteral); ok && isIdentifierName(key.Value.String()) {
 			return key.Idx
 		}
+	case *ast.SuperExpression:
+		return callee.Idx
 	case *ast.Identifier:
 		if callee.Name == "eval" {
 			return callee.Idx
@@ -941,7 +946,7 @@ func (c *compiler) callCoordinate(v *ast.CallExpression) file.Idx {
 func (e *compiledDotExpr) emitGetter(putOnStack bool) {
 	e.left.emitGetter(true)
 	e.addSrcMap()
-	e.c.emit(getPropSource{name: e.name, baseSource: e.baseSource})
+	e.c.emit(getPropSource{namedProp: e.c.newNamedProp(e.name), baseSource: e.baseSource})
 	if !putOnStack {
 		e.c.emit(pop)
 	}
@@ -963,15 +968,15 @@ func (e *compiledDotExpr) emitSetter(valueExpr compiledExpr, putOnStack bool) {
 	e.c.emit(checkBase{name: e.name, depth: 1, baseSource: e.baseSource, assign: true})
 	if e.c.scope.strict {
 		if putOnStack {
-			e.c.emit(setPropStrict(e.name))
+			e.c.emit(setPropStrict{e.c.newNamedProp(e.name)})
 		} else {
-			e.c.emit(setPropStrictP(e.name))
+			e.c.emit(setPropStrictP{e.c.newNamedProp(e.name)})
 		}
 	} else {
 		if putOnStack {
-			e.c.emit(setProp(e.name))
+			e.c.emit(setProp{e.c.newNamedProp(e.name)})
 		} else {
-			e.c.emit(setPropP(e.name))
+			e.c.emit(setPropP{e.c.newNamedProp(e.name)})
 		}
 	}
 }
@@ -980,34 +985,34 @@ func (e *compiledDotExpr) emitUnary(prepare, body func(), postfix, putOnStack bo
 	if !putOnStack {
 		e.left.emitGetter(true)
 		e.c.emit(dup)
-		e.c.emit(getPropSource{name: e.name, baseSource: e.baseSource})
+		e.c.emit(getPropSource{namedProp: e.c.newNamedProp(e.name), baseSource: e.baseSource})
 		body()
 		e.addSrcMap()
 		if e.c.scope.strict {
-			e.c.emit(setPropStrictP(e.name))
+			e.c.emit(setPropStrictP{e.c.newNamedProp(e.name)})
 		} else {
-			e.c.emit(setPropP(e.name))
+			e.c.emit(setPropP{e.c.newNamedProp(e.name)})
 		}
 	} else {
 		if !postfix {
 			e.left.emitGetter(true)
 			e.c.emit(dup)
-			e.c.emit(getPropSource{name: e.name, baseSource: e.baseSource})
+			e.c.emit(getPropSource{namedProp: e.c.newNamedProp(e.name), baseSource: e.baseSource})
 			if prepare != nil {
 				prepare()
 			}
 			body()
 			e.addSrcMap()
 			if e.c.scope.strict {
-				e.c.emit(setPropStrict(e.name))
+				e.c.emit(setPropStrict{e.c.newNamedProp(e.name)})
 			} else {
-				e.c.emit(setProp(e.name))
+				e.c.emit(setProp{e.c.newNamedProp(e.name)})
 			}
 		} else {
 			e.c.emit(loadUndef)
 			e.left.emitGetter(true)
 			e.c.emit(dup)
-			e.c.emit(getPropSource{name: e.name, baseSource: e.baseSource})
+			e.c.emit(getPropSource{namedProp: e.c.newNamedProp(e.name), baseSource: e.baseSource})
 			if prepare != nil {
 				prepare()
 			}
@@ -1015,9 +1020,9 @@ func (e *compiledDotExpr) emitUnary(prepare, body func(), postfix, putOnStack bo
 			body()
 			e.addSrcMap()
 			if e.c.scope.strict {
-				e.c.emit(setPropStrictP(e.name))
+				e.c.emit(setPropStrictP{e.c.newNamedProp(e.name)})
 			} else {
-				e.c.emit(setPropP(e.name))
+				e.c.emit(setPropP{e.c.newNamedProp(e.name)})
 			}
 		}
 	}
@@ -1325,6 +1330,50 @@ func (e *compiledTemplateLiteral) emitGetter(putOnStack bool) {
 	}
 }
 
+// duplicateParameter 按 SpiderMonkey 解析形参的顺序找出重复形参的报错位置与文案：disallow 为该种函数不允许重复形参，strict 为解析形参时已知的严格模式；形参先出现重复、之后才出现默认值、解构或剩余形参时报在该记号处，没有报错时位置为 -1
+func (c *compiler) duplicateParameter(params *ast.ParameterList, disallow, strict bool) (int, string) {
+	const message = "duplicate argument names not allowed in this context"
+	seen := map[unistring.String]bool{}
+	duplicated := false
+	offset, text := -1, ""
+	declare := func(name unistring.String, at int) {
+		switch {
+		case offset >= 0:
+		case !seen[name]:
+			seen[name] = true
+		case disallow:
+			offset, text = at, message
+		case strict:
+			offset, text = at, fmt.Sprintf("duplicate formal argument %s", name)
+		default:
+			duplicated = true
+		}
+	}
+	nonSimple := func(at file.Idx) bool {
+		disallow = true
+		if duplicated && offset < 0 {
+			offset, text = int(at)-1, message
+		}
+		return offset >= 0
+	}
+	bind := func(target ast.Expression) {
+		if _, ok := target.(*ast.Identifier); !ok && nonSimple(target.Idx0()) {
+			return
+		}
+		c.createBindings(target, declare)
+	}
+	for _, item := range params.List {
+		bind(item.Target)
+		if item.Initializer != nil && nonSimple(item.Assign) || offset >= 0 {
+			return offset, text
+		}
+	}
+	if params.Rest != nil && !nonSimple(params.Ellipsis) {
+		bind(params.Rest)
+	}
+	return offset, text
+}
+
 func (c *compiler) compileParameterBindingIdentifier(name unistring.String, offset int) (*binding, bool) {
 	if c.scope.strict {
 		c.checkIdentifierName(name, offset)
@@ -1335,7 +1384,7 @@ func (c *compiler) compileParameterBindingIdentifier(name unistring.String, offs
 
 func (c *compiler) compileParameterPatternIdBinding(name unistring.String, offset int) {
 	if _, unique := c.compileParameterBindingIdentifier(name, offset); !unique {
-		c.throwSyntaxError(offset, "Duplicate parameter name not allowed in this context")
+		c.throwSyntaxError(offset, "duplicate argument names not allowed in this context")
 	}
 }
 
@@ -1371,7 +1420,10 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		code:   e.c.newCode(preambleLen, 16),
 		srcMap: []srcMapItem{{srcPos: e.offset}},
 		host:   e.c.host,
+		shared: e.c.shared,
+		lazy:   e.c.lazy,
 	}
+	e.c.programs = append(e.c.programs, e.c.p)
 	e.c.newScope()
 	s := e.c.scope
 	s.funcType = e.typ
@@ -1397,6 +1449,10 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		typ: blockScope,
 	}
 
+	if offset, message := e.c.duplicateParameter(e.parameterList, e.typ == funcArrow || e.typ == funcMethod || e.typ == funcCtor || e.typ == funcDerivedCtor, s.strict); offset >= 0 {
+		e.c.throwSyntaxError(offset, message)
+		return
+	}
 	if !s.strict {
 		s.strict = e.strict != nil
 	}
@@ -1404,6 +1460,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	hasPatterns := false
 	hasInits := false
 	firstDupIdx := -1
+	var firstDupName unistring.String
 
 	if e.parameterList.Rest != nil {
 		hasPatterns = true // strictly speaking not, but we need to activate all the checks
@@ -1415,8 +1472,8 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 		case *ast.Identifier:
 			offset := int(tgt.Idx) - 1
 			b, unique := e.c.compileParameterBindingIdentifier(tgt.Name, offset)
-			if !unique {
-				firstDupIdx = offset
+			if !unique && firstDupIdx < 0 {
+				firstDupIdx, firstDupName = offset, tgt.Name
 			}
 			b.isArg = true
 		case ast.Pattern:
@@ -1431,8 +1488,8 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 			hasInits = true
 		}
 
-		if firstDupIdx >= 0 && (hasPatterns || hasInits || s.strict || e.typ == funcArrow || e.typ == funcMethod) {
-			e.c.throwSyntaxError(firstDupIdx, "Duplicate parameter name not allowed in this context")
+		if firstDupIdx >= 0 && s.strict {
+			e.c.throwSyntaxErrorf(firstDupIdx, "duplicate formal argument %s", firstDupName)
 			return
 		}
 
@@ -1819,10 +1876,14 @@ type compiledClassLiteral struct {
 	baseCompiledExpr
 	name       *ast.Identifier
 	superClass compiledExpr
-	body       []ast.ClassElement
-	lhsName    unistring.String
-	source     string
-	isExpr     bool
+	// superText 是 extends 表达式的反编译文本
+	superText string
+	// superOffset 是继承目标无效时的报错位置，extends 表达式为调用时取调用位置，否则取 class 位置
+	superOffset int
+	body        []ast.ClassElement
+	lhsName     unistring.String
+	source      string
+	isExpr      bool
 }
 
 func (c *compiler) processKey(expr ast.Expression) (val unistring.String, computed bool) {
@@ -1872,6 +1933,7 @@ func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
 	var clsName unistring.String
 	if name := e.name; name != nil {
 		clsName = name.Name
+		e.c.checkIdentifierName(clsName, int(name.Idx)-1)
 		clsBinding = e.c.createLexicalIdBinding(clsName, true, int(name.Idx)-1)
 	} else {
 		clsName = e.lhsName
@@ -1907,7 +1969,7 @@ func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
 				if id, ok := elt.Key.(*ast.StringLiteral); ok {
 					if !elt.Computed && id.Value == "constructor" {
 						if ctorMethod != nil {
-							e.c.throwSyntaxError(int(id.Idx)-1, "A class may only have one constructor")
+							e.c.throwSyntaxError(int(id.Idx)-1, "a class cannot have more than one constructor definition")
 						}
 						ctorMethod = elt
 						ctorMethodIdx = idx
@@ -1943,8 +2005,10 @@ func (e *compiledClassLiteral) emitGetter(putOnStack bool) {
 				source: e.source,
 			},
 		}
-		e.addSrcMap()
+		e.c.p.addSrcMap(e.superOffset)
+		e.c.setOperandText(e.superText)
 		e.c.emit(ndc)
+		e.addSrcMap()
 		newClassIns = &ndc.newClass
 	} else {
 		newClassIns = &newClass{
@@ -2207,7 +2271,9 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 		funcName: funcName,
 		code:     e.c.newCode(2, 16),
 		host:     e.c.host,
+		shared:   e.c.shared,
 	}
+	e.c.programs = append(e.c.programs, e.c.p)
 
 	e.c.newScope()
 	s := e.c.scope
@@ -2282,9 +2348,14 @@ func (c *compiler) compileClassLiteral(v *ast.ClassLiteral, isExpr bool) *compil
 	r := &compiledClassLiteral{
 		name:       v.Name,
 		superClass: c.compileExpression(v.SuperClass),
+		superText:  decompileExpression(v.SuperClass),
 		body:       v.Body,
 		source:     v.Source,
 		isExpr:     isExpr,
+	}
+	r.superOffset = int(v.Idx0()) - 1
+	if call, ok := v.SuperClass.(*ast.CallExpression); ok {
+		r.superOffset = int(c.callCoordinate(call)) - 1
 	}
 	r.init(c, v.Idx0())
 	return r
@@ -2367,6 +2438,8 @@ func (e *compiledNewExpr) emitGetter(putOnStack bool) {
 		expr.emitGetter(true)
 	}
 	e.addSrcMap()
+	e.c.setOperandText(e.calleeText)
+	e.c.setArgumentTexts(e.argTexts)
 	if e.isVariadic {
 		e.c.emit(newVariadic, endVariadic)
 	} else {
@@ -2395,6 +2468,8 @@ func (c *compiler) compileNewExpression(v *ast.NewExpression) compiledExpr {
 	r := &compiledNewExpr{
 		compiledCallExpr: compiledCallExpr{
 			callee:     c.compileExpression(v.Callee),
+			calleeText: decompileExpression(v.Callee),
+			argTexts:   argumentTexts(v.ArgumentList),
 			args:       args,
 			isVariadic: isVariadic,
 		},
@@ -3066,7 +3141,7 @@ func (c *compiler) emitCallee(callee compiledExpr) (calleeName unistring.String)
 	switch callee := callee.(type) {
 	case *compiledDotExpr:
 		callee.left.emitGetter(true)
-		c.emit(checkBase{name: callee.name, baseSource: callee.baseSource}, getPropCallee(callee.name))
+		c.emit(checkBase{name: callee.name, baseSource: callee.baseSource}, getPropCallee{c.newNamedProp(callee.name)})
 	case *compiledPrivateDotExpr:
 		callee.left.emitGetter(true)
 		rn, id := c.resolvePrivateName(callee.name, callee.offset)
@@ -3108,6 +3183,17 @@ func (c *compiler) emitCallee(callee compiledExpr) (calleeName unistring.String)
 	return
 }
 
+// setArgumentTexts 记录下一条调用或 new 指令各实参的反编译文本
+func (c *compiler) setArgumentTexts(texts []string) {
+	if len(texts) == 0 {
+		return
+	}
+	if c.p.argTexts == nil {
+		c.p.argTexts = make(map[int][]string)
+	}
+	c.p.argTexts[len(c.p.code)] = texts
+}
+
 // setOperandText 记录下一条指令报错时使用的操作数反编译文本
 func (c *compiler) setOperandText(text string) {
 	if c.p.calleeText == nil {
@@ -3133,6 +3219,7 @@ func (e *compiledCallExpr) emitGetter(putOnStack bool) {
 		}
 		e.c.p.calleeText[len(e.c.p.code)] = e.calleeText
 	}
+	e.c.setArgumentTexts(e.argTexts)
 	if _, ok := e.callee.(*compiledSuperExpr); ok {
 		b, eval := e.c.scope.lookupThis()
 		e.c.assert(eval || b != nil, e.offset, "super call, but no 'this' binding")
@@ -3203,17 +3290,17 @@ func (c *compiler) compileSpreadCallArgument(spread *ast.SpreadElement) compiled
 	return r
 }
 
-func (c *compiler) compileCallee(v ast.Expression) compiledExpr {
-	if sup, ok := v.(*ast.SuperExpression); ok {
+func (c *compiler) compileCallee(v *ast.CallExpression) compiledExpr {
+	if sup, ok := v.Callee.(*ast.SuperExpression); ok {
 		if s := c.scope.nearestThis(); s != nil && s.funcType == funcDerivedCtor {
 			e := &compiledSuperExpr{}
 			e.init(c, sup.Idx)
 			return e
 		}
-		c.throwSyntaxError(int(v.Idx0())-1, "'super' keyword unexpected here")
+		c.throwSyntaxError(int(v.LeftParenthesis)-1, "super() is only valid in derived class constructors")
 		panic("unreachable")
 	}
-	return c.compileExpression(v)
+	return c.compileExpression(v.Callee)
 }
 
 func (c *compiler) compileCallExpression(v *ast.CallExpression) compiledExpr {
@@ -3231,8 +3318,9 @@ func (c *compiler) compileCallExpression(v *ast.CallExpression) compiledExpr {
 
 	r := &compiledCallExpr{
 		args:       args,
-		callee:     c.compileCallee(v.Callee),
+		callee:     c.compileCallee(v),
 		calleeText: decompileExpression(v.Callee),
+		argTexts:   argumentTexts(v.ArgumentList),
 		isVariadic: isVariadic,
 	}
 	r.init(c, c.callCoordinate(v))

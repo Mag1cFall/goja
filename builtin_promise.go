@@ -251,7 +251,14 @@ func (r *Runtime) builtin_newPromise(args []Value, newTarget *Object) *Object {
 	if len(args) > 0 {
 		arg0 = args[0]
 	}
-	executor := r.toCallable(arg0)
+	executorObj, _ := arg0.(*Object)
+	if executorObj == nil {
+		panic(r.NewTypeError("%s is not a function", r.argumentText(nilSafe(arg0))))
+	}
+	executor, ok := executorObj.self.assertCallable()
+	if !ok {
+		panic(r.NewTypeError("%s is not a function", r.argumentText(arg0)))
+	}
 
 	proto := r.getPrototypeFromCtor(newTarget, r.global.Promise, r.getPromisePrototype())
 	po := r.newPromise(proto)

@@ -108,7 +108,7 @@ func (self *_parser) parsePrimaryExpression() ast.Expression {
 		}
 	}
 
-	self.errorUnexpectedToken(self.token)
+	self.errorExpectedExpression()
 	self.nextStatement()
 	return &ast.BadExpression{From: idx, To: self.idx}
 }
@@ -120,7 +120,7 @@ func (self *_parser) parseSuperProperty() ast.Expression {
 	case token.PERIOD:
 		self.next()
 		if !token.IsId(self.token) {
-			self.expect(token.IDENTIFIER)
+			self.error(self.idx, "missing name after . operator")
 			self.nextStatement()
 			return &ast.BadExpression{From: idx, To: self.idx}
 		}
@@ -145,7 +145,7 @@ func (self *_parser) parseSuperProperty() ast.Expression {
 			Idx: idx,
 		})
 	default:
-		self.error(idx, "'super' keyword unexpected here")
+		self.error(idx, "invalid use of keyword 'super'")
 		self.nextStatement()
 		return &ast.BadExpression{From: idx, To: self.idx}
 	}
@@ -206,7 +206,7 @@ func (self *_parser) parseParenthesisedExpression() ast.Expression {
 			}
 		}
 	}
-	self.expect(token.RIGHT_PARENTHESIS)
+	self.expectWith(token.RIGHT_PARENTHESIS, "missing ) in parenthetical")
 	if len(list) == 1 && len(self.errors) == 0 {
 		return list[0]
 	}
@@ -299,7 +299,16 @@ func (self *_parser) parseBindingTarget() (target ast.BindingTarget) {
 	case token.LEFT_BRACE:
 		target = self.parseObjectBindingPattern()
 	default:
-		idx := self.expect(token.IDENTIFIER)
+		idx := self.idx
+		switch {
+		case self.token == token.YIELD || self.token == token.AWAIT:
+			self.error(idx, "%s is a reserved identifier", self.token.String())
+		case self.scope.inFuncParams:
+			self.error(idx, "missing formal parameter")
+		default:
+			self.error(idx, "missing variable name, got %s", self.describe(self.token))
+		}
+		self.next()
 		self.nextStatement()
 		target = &ast.BadExpression{From: idx, To: self.idx}
 	}
@@ -317,6 +326,7 @@ func (self *_parser) parseVariableDeclaration(declarationList *[]*ast.Binding) *
 	}
 
 	if self.token == token.ASSIGN {
+		node.Assign = self.idx
 		self.next()
 		node.Initializer = self.parseAssignmentExpression()
 	}
@@ -415,6 +425,7 @@ func (self *_parser) parseObjectProperty() ast.Property {
 	}
 	if token.IsId(tkn) || tkn == token.STRING || tkn == token.NUMBER || tkn == token.ILLEGAL {
 		if generator {
+			self.expectMethodParameters()
 			return &ast.PropertyKeyed{
 				Key:      value,
 				Kind:     ast.PropertyKindMethod,
@@ -459,6 +470,7 @@ func (self *_parser) parseObjectProperty() ast.Property {
 				return nil
 			}
 
+			self.expectMethodParameters()
 			var kind ast.PropertyKind
 			var async bool
 			if tkn == token.ASYNC {
@@ -479,12 +491,19 @@ func (self *_parser) parseObjectProperty() ast.Property {
 		}
 	}
 
-	self.expect(token.COLON)
+	self.expectWith(token.COLON, "missing : after property id")
 	return &ast.PropertyKeyed{
 		Key:      value,
 		Kind:     ast.PropertyKindValue,
 		Value:    self.parseAssignmentExpression(),
 		Computed: tkn == token.ILLEGAL,
+	}
+}
+
+// expectMethodParameters 要求对象字面量方法的属性名后紧跟形参列表，否则按 SpiderMonkey 报告缺少冒号
+func (self *_parser) expectMethodParameters() {
+	if self.token != token.LEFT_PARENTHESIS {
+		self.error(self.idx, "missing : after property id")
 	}
 }
 
@@ -533,12 +552,12 @@ func (self *_parser) parseObjectLiteral() *ast.ObjectLiteral {
 			value = append(value, property)
 		}
 		if self.token != token.RIGHT_BRACE {
-			self.expect(token.COMMA)
+			self.expectWith(token.COMMA, "missing } after property list")
 		} else {
 			break
 		}
 	}
-	idx1 := self.expect(token.RIGHT_BRACE)
+	idx1 := self.expectWith(token.RIGHT_BRACE, "missing } after property list")
 
 	return &ast.ObjectLiteral{
 		LeftBrace:  idx0,
@@ -566,10 +585,10 @@ func (self *_parser) parseArrayLiteral() *ast.ArrayLiteral {
 			value = append(value, self.parseAssignmentExpression())
 		}
 		if self.token != token.RIGHT_BRACKET {
-			self.expect(token.COMMA)
+			self.expectWith(token.COMMA, "missing ] after element list")
 		}
 	}
-	idx1 := self.expect(token.RIGHT_BRACKET)
+	idx1 := self.expectWith(token.RIGHT_BRACKET, "missing ] after element list")
 
 	return &ast.ArrayLiteral{
 		LeftBracket:  idx0,
@@ -606,7 +625,7 @@ func (self *_parser) parseTemplateLiteral(tagged bool) *ast.TemplateLiteral {
 		expr := self.parseExpression()
 		res.Expressions = append(res.Expressions, expr)
 		if self.token != token.RIGHT_BRACE {
-			self.errorUnexpectedToken(self.token)
+			self.error(self.idx, "missing } in template string")
 		}
 	}
 	return res
@@ -636,7 +655,7 @@ func (self *_parser) parseArgumentList() (argumentList []ast.Expression, idx0, i
 		}
 		self.next()
 	}
-	idx1 = self.expect(token.RIGHT_PARENTHESIS)
+	idx1 = self.expectWith(token.RIGHT_PARENTHESIS, "missing ) after argument list")
 	return
 }
 
@@ -671,7 +690,7 @@ func (self *_parser) parseDotMember(left ast.Expression) ast.Expression {
 	}
 
 	if !token.IsId(self.token) {
-		self.expect(token.IDENTIFIER)
+		self.error(self.idx, "missing name after . operator")
 		self.nextStatement()
 		return &ast.BadExpression{From: period, To: self.idx}
 	}
@@ -690,7 +709,7 @@ func (self *_parser) parseDotMember(left ast.Expression) ast.Expression {
 func (self *_parser) parseBracketMember(left ast.Expression) ast.Expression {
 	idx0 := self.expect(token.LEFT_BRACKET)
 	member := self.parseExpression()
-	idx1 := self.expect(token.RIGHT_BRACKET)
+	idx1 := self.expectWith(token.RIGHT_BRACKET, "missing ] in index expression")
 	return &ast.BracketExpression{
 		LeftBracket:  idx0,
 		Left:         left,
@@ -718,6 +737,9 @@ func (self *_parser) parseNewExpression() ast.Expression {
 	if bad, ok := callee.(*ast.BadExpression); ok {
 		bad.From = idx
 		return bad
+	}
+	if self.token == token.QUESTION_DOT {
+		self.error(idx, "new keyword cannot be used with an optional chain")
 	}
 	node := &ast.NewExpression{
 		New:    idx,
@@ -875,17 +897,18 @@ func (self *_parser) parseUnaryExpression() ast.Expression {
 	case token.AWAIT:
 		if self.scope.allowAwait {
 			idx := self.idx
-			self.next()
-			if !self.scope.inAsync {
-				self.errorUnexpectedToken(token.AWAIT)
+			if self.scope.inFuncParams && self.arrowParams || !self.scope.inAsync && !self.scope.inFuncParams {
+				self.error(idx, "await is a reserved identifier")
+				self.next()
 				return &ast.BadExpression{
 					From: idx,
 					To:   self.idx,
 				}
 			}
 			if self.scope.inFuncParams {
-				self.error(idx, "Illegal await-expression in formal parameters of async function")
+				self.error(idx, "await expression can't be used in parameter")
 			}
+			self.next()
 			return &ast.AwaitExpression{
 				Await:    idx,
 				Argument: self.parseUnaryExpression(),
@@ -1186,7 +1209,7 @@ func (self *_parser) parseConditionalExpression() ast.Expression {
 		self.scope.allowIn = true
 		consequent := self.parseAssignmentExpression()
 		self.scope.allowIn = allowIn
-		self.expect(token.COLON)
+		self.expectWith(token.COLON, "missing : in conditional expression")
 		return &ast.ConditionalExpression{
 			Test:       left,
 			Consequent: consequent,
@@ -1316,7 +1339,7 @@ func (self *_parser) parseAssignmentExpression() ast.Expression {
 				paramList = self.reinterpretSequenceAsArrowFuncParams(seq.Sequence)
 			} else {
 				self.restore(&state)
-				paramList = self.parseFunctionParameterList()
+				paramList = self.parseArrowParameterList()
 			}
 		} else if async {
 			// async (x, y) => ...
@@ -1329,7 +1352,7 @@ func (self *_parser) parseAssignmentExpression() ast.Expression {
 			if _, ok := left.(*ast.CallExpression); ok {
 				self.restore(&state)
 				self.next() // skip "async"
-				paramList = self.parseFunctionParameterList()
+				paramList = self.parseArrowParameterList()
 			}
 		}
 		if paramList == nil {
@@ -1372,11 +1395,25 @@ func (self *_parser) parseAssignmentExpression() ast.Expression {
 	return left
 }
 
+// parseArrowParameterList 把已解析为括号表达式的源码重新解析为箭头函数形参
+func (self *_parser) parseArrowParameterList() *ast.ParameterList {
+	arrowParams := self.arrowParams
+	self.arrowParams = true
+	defer func() {
+		self.arrowParams = arrowParams
+	}()
+	return self.parseFunctionParameterList()
+}
+
 func (self *_parser) parseYieldExpression() ast.Expression {
 	idx := self.expect(token.YIELD)
 
 	if self.scope.inFuncParams {
-		self.error(idx, "Yield expression not allowed in formal parameter")
+		if self.arrowParams {
+			self.error(idx, "yield is a reserved identifier")
+		} else {
+			self.error(idx, "yield expression can't be used in parameter")
+		}
 	}
 
 	node := &ast.YieldExpression{
@@ -1390,15 +1427,12 @@ func (self *_parser) parseYieldExpression() ast.Expression {
 		return node
 	}
 
-	if !self.implicitSemicolon && self.token != token.SEMICOLON && self.token != token.RIGHT_BRACE && self.token != token.EOF {
-		var state parserState
-		self.mark(&state)
-		expr := self.parseAssignmentExpression()
-		if _, bad := expr.(*ast.BadExpression); bad {
-			expr = nil
-			self.restore(&state)
+	switch self.token {
+	case token.SEMICOLON, token.RIGHT_BRACE, token.RIGHT_BRACKET, token.RIGHT_PARENTHESIS, token.COLON, token.COMMA, token.IN, token.EOF:
+	default:
+		if !self.implicitSemicolon {
+			node.Argument = self.parseAssignmentExpression()
 		}
-		node.Argument = expr
 	}
 
 	return node

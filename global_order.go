@@ -25,6 +25,10 @@ func (r *Runtime) SetGlobalObserver(observer GlobalObserver) {
 	r.globalObserver = observer
 	if _, wrapped := r.globalObject.self.(*observedGlobal); !wrapped {
 		r.globalObject.self = &observedGlobal{objectImpl: r.globalObject.self, r: r}
+		r.globalObject.kind = kindNone
+		if r.globalObject.shape != nil && !r.globalObject.shape.dict {
+			r.globalObject.shape = r.globalObject.shape.toDict()
+		}
 	}
 }
 

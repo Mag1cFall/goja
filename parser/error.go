@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/Mag1cFall/goja/file"
 	"github.com/Mag1cFall/goja/token"
@@ -98,27 +99,69 @@ func (self *_parser) errorUnexpected(idx file.Idx, chr rune) error {
 }
 
 func (self *_parser) errorUnexpectedToken(tkn token.Token) error {
+	if tkn == token.ESCAPED_RESERVED_WORD {
+		return self.error(self.idx, "Keyword must not contain escaped characters")
+	}
+	return self.error(self.idx, "unexpected token: %s", self.describe(tkn))
+}
+
+// errorExpectedExpression 按 SpiderMonkey 报告当前位置缺少表达式，yield 与 await 报告为保留标识符
+func (self *_parser) errorExpectedExpression() error {
+	if self.token == token.YIELD || self.token == token.AWAIT {
+		return self.error(self.idx, "%s is a reserved identifier", self.token.String())
+	}
+	return self.error(self.idx, "expected expression, got %s", self.describe(self.token))
+}
+
+// describe 返回 SpiderMonkey TokenKindToDesc 对词法单元 tkn 的描述，tkn 为当前词法单元时按其源码文本区分
+func (self *_parser) describe(tkn token.Token) string {
+	literal := tkn.String()
+	if tkn == self.token {
+		literal = self.literal
+	}
+	return tokenDescription(tkn, literal)
+}
+
+// tokenDescription 返回 SpiderMonkey TokenKindToDesc 对源码文本为 literal 的词法单元 tkn 的描述
+func tokenDescription(tkn token.Token, literal string) string {
 	switch tkn {
 	case token.EOF:
-		return self.error(file.Idx(0), err_UnexpectedEndOfInput)
-	}
-	value := tkn.String()
-	switch tkn {
-	case token.BOOLEAN, token.NULL:
-		value = self.literal
+		return "end of script"
 	case token.IDENTIFIER:
-		return self.error(self.idx, "unexpected token: identifier")
-	case token.KEYWORD:
-		// TODO Might be a future reserved word
-		return self.error(self.idx, "Unexpected reserved word")
-	case token.ESCAPED_RESERVED_WORD:
-		return self.error(self.idx, "Keyword must not contain escaped characters")
+		switch literal {
+		case "as", "async", "await", "each", "from", "get", "let", "meta", "of", "set", "static", "target", "yield":
+			return "'" + literal + "'"
+		case "implements", "interface", "package", "private", "protected", "public":
+			return "reserved word '" + literal + "'"
+		}
+		return "identifier"
+	case token.PRIVATE_IDENTIFIER:
+		return "private identifier"
 	case token.NUMBER:
-		return self.error(self.idx, "unexpected token: numeric literal")
+		if strings.HasSuffix(literal, "n") {
+			return "bigint literal"
+		}
+		return "numeric literal"
 	case token.STRING:
-		return self.error(self.idx, "unexpected token: string literal")
+		return "string literal"
+	case token.BACKTICK:
+		return "template literal"
+	case token.BOOLEAN:
+		return "boolean literal '" + literal + "'"
+	case token.NULL:
+		return "null literal"
+	case token.KEYWORD:
+		if literal == "enum" {
+			return "reserved word 'enum'"
+		}
+		return "keyword '" + literal + "'"
+	case token.LET, token.STATIC, token.ASYNC, token.AWAIT, token.YIELD, token.OF:
+		return "'" + tkn.String() + "'"
 	}
-	return self.error(self.idx, err_UnexpectedToken, value)
+	if tkn >= token.IF && tkn <= token.INSTANCEOF {
+		return "keyword '" + tkn.String() + "'"
+	}
+	return "'" + tkn.String() + "'"
 }
 
 // ErrorList is a list of *Errors.
